@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#070b10">
+  <title>lanwatch · LAN devices</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="ambient" aria-hidden="true"></div>
+
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo" aria-hidden="true">
+          <svg viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="1.6">
+            <circle cx="16" cy="16" r="12.5" opacity=".28"/>
+            <circle cx="16" cy="16" r="7.5" opacity=".45"/>
+            <circle cx="16" cy="16" r="2.4" fill="currentColor" stroke="none"/>
+            <path d="M16 16 26.5 5.5" stroke-linecap="round"/>
+            <circle cx="23.2" cy="8.8" r="1.6" fill="currentColor" stroke="none"/>
+          </svg>
+        </span>
+        <div class="brand-text">
+          <h1>lanwatch</h1>
+          <p id="brand-sub">LAN device discovery</p>
+        </div>
+      </div>
+
+      <div class="topbar-right">
+        <button class="net-chip" id="net-chip" type="button" title="Open scan settings">
+          <span class="net-dot" id="net-dot"></span>
+          <span class="net-cidr mono" id="net-cidr">detecting…</span>
+          <span class="net-if" id="net-if"></span>
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09A1.7 1.7 0 0 0 9 19.36a1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.64 15a1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.64 9a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 9 4.64a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.7 1.7 0 0 0 19.36 9c.23.6.8 1 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1z"/>
+          </svg>
+        </button>
+
+        <div class="btn-group">
+          <div class="menu-wrap">
+            <button class="btn ghost" id="export-btn" aria-haspopup="menu" aria-expanded="false">
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M12 3v12M7 10l5 5 5-5M4 21h16"/>
+              </svg>
+              <span class="btn-label">Export</span>
+            </button>
+            <div class="menu" id="export-menu" role="menu" hidden>
+              <a role="menuitem" href="/api/export.csv">Download CSV</a>
+              <a role="menuitem" href="/api/export.json">Download JSON</a>
+            </div>
+          </div>
+          <button class="btn ghost icon-only" id="settings-btn" aria-label="Scan settings" title="Scan settings">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12M20 18h0"/>
+              <circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/>
+            </svg>
+          </button>
+          <button class="btn primary" id="scan-btn">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="2.6"/><circle cx="12" cy="12" r="7"/><path d="M12 12l6.5-6.5"/>
+            </svg>
+            <span>Scan</span>
+          </button>
+          <button class="btn danger" id="stop-btn" hidden>
+            <svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+            <span>Stop</span>
+          </button>
+        </div>
+      </div>
+    </header>
+
+    <main>
+      <section class="stats" aria-label="Summary">
+        <article class="stat stat-accent">
+          <span class="stat-label">Online</span>
+          <strong id="stat-online">–</strong>
+          <span class="stat-sub" id="stat-online-sub">no scan yet</span>
+        </article>
+        <article class="stat">
+          <span class="stat-label">Known devices</span>
+          <strong id="stat-known">–</strong>
+          <span class="stat-sub" id="stat-known-sub">inventory</span>
+        </article>
+        <article class="stat">
+          <span class="stat-label">Open services</span>
+          <strong id="stat-services">–</strong>
+          <span class="stat-sub" id="stat-services-sub">across the LAN</span>
+        </article>
+        <article class="stat">
+          <span class="stat-label">Median latency</span>
+          <strong id="stat-latency">–</strong>
+          <span class="stat-sub" id="stat-latency-sub">ICMP round trip</span>
+        </article>
+      </section>
+
+      <section class="scan-panel" aria-label="Scan status">
+        <div class="scan-line">
+          <span class="pulse" id="scan-pulse" aria-hidden="true"></span>
+          <div class="scan-info" role="status" aria-live="polite">
+            <span id="scan-phase">Idle</span>
+            <span class="muted" id="scan-detail"></span>
+          </div>
+          <span class="sync" id="sync" title="Live event stream">connecting…</span>
+        </div>
+        <div class="progress" aria-hidden="true"><span id="progress-bar"></span></div>
+        <div class="collectors" id="collectors" aria-label="Discovery sources"></div>
+      </section>
+
+      <section class="devices">
+        <div class="toolbar">
+          <div class="search">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+              <circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/>
+            </svg>
+            <input id="search" type="search" placeholder="Filter by IP, name, vendor, service…" autocomplete="off" spellcheck="false" aria-label="Filter devices">
+            <kbd>/</kbd>
+          </div>
+          <div class="toolbar-right">
+            <label class="check"><input type="checkbox" id="show-offline" checked><span>Offline</span></label>
+            <span class="sep" aria-hidden="true"></span>
+            <label class="check"><input type="checkbox" id="auto-scan"><span>Auto</span></label>
+            <select id="auto-interval" aria-label="Auto-scan interval">
+              <option value="30">30s</option>
+              <option value="60" selected>1m</option>
+              <option value="300">5m</option>
+              <option value="900">15m</option>
+            </select>
+            <select id="sort" aria-label="Sort devices">
+              <option value="ip">Sort · IP</option>
+              <option value="name">Sort · name</option>
+              <option value="latency">Sort · latency</option>
+              <option value="seen">Sort · last seen</option>
+              <option value="services">Sort · services</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="table-wrap">
+          <table class="device-table" id="device-table">
+            <thead>
+              <tr>
+                <th class="col-device">Device</th>
+                <th class="col-addr">Address</th>
+                <th class="col-services">Services</th>
+                <th class="col-latency">Latency</th>
+                <th class="col-seen">Last seen</th>
+                <th class="col-go"><span class="visually-hidden">Details</span></th>
+              </tr>
+            </thead>
+            <tbody id="device-rows"></tbody>
+          </table>
+
+          <div class="empty" id="empty-state" hidden>
+            <div class="empty-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round">
+                <circle cx="12" cy="12" r="9" opacity=".3"/><circle cx="12" cy="12" r="5" opacity=".55"/>
+                <circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/><path d="M12 12l5-5"/>
+              </svg>
+            </div>
+            <h2 id="empty-title">No devices yet</h2>
+            <p id="empty-text">Run a scan to discover what is on your network.</p>
+            <button class="btn primary" id="empty-scan">Scan now</button>
+          </div>
+        </div>
+
+        <p class="hint" id="table-hint"></p>
+      </section>
+    </main>
+
+    <footer class="foot">
+      <span>lanwatch <span id="version">0.1.0</span></span>
+      <span id="foot-host"></span>
+      <span class="mono" id="state-path"></span>
+    </footer>
+  </div>
+
+  <div class="backdrop" id="backdrop" hidden></div>
+
+  <aside class="drawer" id="drawer" aria-hidden="true" aria-labelledby="drawer-title" role="dialog">
+    <div class="drawer-head">
+      <span class="device-icon lg" id="drawer-icon" aria-hidden="true"></span>
+      <div class="drawer-title-wrap">
+        <h2 id="drawer-title">Device</h2>
+        <p class="mono" id="drawer-ip"></p>
+      </div>
+      <button class="icon-btn" id="drawer-close" aria-label="Close details">×</button>
+    </div>
+    <div class="drawer-badges" id="drawer-badges"></div>
+    <div class="drawer-body">
+      <section>
+        <h3>Identity</h3>
+        <label class="field">
+          <span>Label</span>
+          <input id="drawer-label" maxlength="60" placeholder="e.g. Living room TV" autocomplete="off">
+        </label>
+        <dl class="kv" id="drawer-identity"></dl>
+      </section>
+      <section>
+        <h3>Services</h3>
+        <div class="chips" id="drawer-services"></div>
+      </section>
+      <section id="drawer-adv-section" hidden>
+        <h3>Advertised</h3>
+        <dl class="kv" id="drawer-adv"></dl>
+      </section>
+      <section>
+        <h3>Notes</h3>
+        <textarea id="drawer-notes" rows="3" maxlength="500" placeholder="Optional notes…"></textarea>
+      </section>
+      <section class="drawer-actions">
+        <button class="btn primary" id="drawer-save">Save</button>
+        <button class="btn ghost" id="drawer-probe">Probe now</button>
+        <button class="btn ghost danger-text" id="drawer-forget">Forget</button>
+      </section>
+    </div>
+  </aside>
+
+  <dialog class="dialog" id="settings">
+    <form id="settings-form">
+      <div class="dialog-head">
+        <h2>Scan settings</h2>
+        <button class="icon-btn" type="button" id="settings-close" aria-label="Close settings">×</button>
+      </div>
+      <div class="dialog-body">
+        <label class="field">
+          <span>Target</span>
+          <select id="opt-target"></select>
+        </label>
+        <label class="field" id="opt-subnet-field" hidden>
+          <span>Custom subnet</span>
+          <input id="opt-subnet" placeholder="192.168.1.0/24" autocomplete="off" spellcheck="false">
+        </label>
+        <label class="field">
+          <span>Ports</span>
+          <input id="opt-ports" placeholder="blank = default service set" autocomplete="off" spellcheck="false">
+        </label>
+        <div class="check-grid">
+          <label class="check"><input type="checkbox" id="opt-deep"><span>Probe hosts that ignore ping</span></label>
+          <label class="check"><input type="checkbox" id="opt-mdns" checked><span>mDNS / Bonjour</span></label>
+          <label class="check"><input type="checkbox" id="opt-ssdp" checked><span>SSDP / UPnP</span></label>
+          <label class="check"><input type="checkbox" id="opt-nbns" checked><span>NetBIOS names</span></label>
+          <label class="check"><input type="checkbox" id="opt-rdns" checked><span>Reverse DNS</span></label>
+        </div>
+        <details class="advanced">
+          <summary>Advanced</summary>
+          <div class="two-col">
+            <label class="field"><span>Ping timeout (s)</span><input id="opt-timeout" type="number" min="0.2" max="10" step="0.1" value="1"></label>
+            <label class="field"><span>Concurrency</span><input id="opt-concurrency" type="number" min="1" max="256" step="1" value="64"></label>
+          </div>
+        </details>
+        <p class="dialog-note">One scan probes at most one subnet. Passive discovery (mDNS/SSDP) may be filtered on Android devices.</p>
+      </div>
+      <div class="dialog-actions">
+        <button class="btn ghost" type="button" id="settings-cancel">Cancel</button>
+        <button class="btn primary" type="submit">Save &amp; scan</button>
+      </div>
+    </form>
+  </dialog>
+
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

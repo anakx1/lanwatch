@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lanwatch"
+dynamic = ["version"]
+description = "LAN device discovery with a live web dashboard"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "lanwatch" }]
+keywords = ["lan", "network", "discovery", "mdns", "ssdp", "dashboard"]
+classifiers = [
+  "Environment :: Console",
+  "Environment :: Web Environment",
+  "Programming Language :: Python :: 3",
+  "Topic :: System :: Networking",
+  "Topic :: System :: Networking :: Monitoring",
+]
+
+[project.scripts]
+lanwatch = "lanwatch.cli:main"
+
+[project.optional-dependencies]
+dev = [
+  "mypy>=1.11,<2",
+  "ruff>=0.8,<1",
+]
+
+[tool.setuptools]
+packages = ["lanwatch"]
+
+[tool.setuptools.dynamic]
+version = {attr = "lanwatch.__version__"}
+
+[tool.setuptools.package-data]
+lanwatch = ["static/*", "py.typed"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 100
+exclude = ["lanwatch/static"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "C4"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.9"
+files = ["lanwatch"]
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+show_error_codes = true
+exclude = ["lanwatch/static"]
