@@ -599,21 +599,27 @@ class ScanEngine:
                 finished = time.time()
                 duration = round(time.monotonic() - started, 2)
                 with self._lock:
-                    if self.state.get("scan_id") == scan_id and self.state.get("running"):
+                    finished_here = bool(
+                        self.state.get("scan_id") == scan_id and self.state.get("running")
+                    )
+                    if finished_here:
                         self.state.update(
-                            running=False,
                             phase="error",
                             message=error,
                             error=error,
                             finished_at=finished,
                             duration_s=duration,
                         )
-                        state = dict(self.state)
+                        state = dict(self.state, running=False)
                     else:
                         state = dict(self.state)
+                # Publish and persist before clearing "running": observers that
+                # wait for the scan to stop must not race the final write.
                 self._emit("scan.error", error=error, state=state)
                 self._emit("scan.finished", state=state, counts=self.store.counts())
                 self.store.save()
+                if finished_here:
+                    self._set_state(running=False)
 
     def _seed_arp(self, network: ipaddress.IPv4Network, seen: set[str]) -> None:
         table, source = collectors.arp_table()
@@ -770,19 +776,23 @@ class ScanEngine:
         stopped: bool = False,
     ) -> None:
         duration = round(time.monotonic() - started, 2)
-        state = self._set_state(
-            running=False,
-            phase="stopped" if stopped else "done",
-            message="scan stopped" if stopped else "scan complete",
-            finished_at=time.time(),
-            duration_s=duration,
-            found=len(seen),
-            stopped=stopped,
-            done=self.state.get("hosts_total", 0),
-            total=self.state.get("hosts_total", 0),
-        )
+        with self._lock:
+            self.state.update(
+                phase="stopped" if stopped else "done",
+                message="scan stopped" if stopped else "scan complete",
+                finished_at=time.time(),
+                duration_s=duration,
+                found=len(seen),
+                stopped=stopped,
+                done=self.state.get("hosts_total", 0),
+                total=self.state.get("hosts_total", 0),
+            )
+            state = dict(self.state, running=False)
+        # Publish and persist before clearing "running": observers that wait
+        # for the scan to stop must not race the final write.
         self.store.save()
         self._emit("scan.finished", state=state, counts=self.store.counts(), stopped=stopped)
+        self._set_state(running=False)
 
 
 def _collect_banners(open_map: dict[str, list[int]]) -> dict[str, dict[str, str]]:
