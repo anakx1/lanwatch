@@ -526,7 +526,7 @@ select:focus-visible { outline: 2px solid rgba(45, 212, 191, 0.6); outline-offse
   white-space: nowrap;
 }
 .chip.more { color: var(--dim); border-style: dashed; }
-.chip.empty { color: var(--dim); border-style: dashed; background: transparent; }
+.chip.blank { color: var(--dim); border-style: dashed; background: transparent; }
 
 .lat { font-family: var(--mono); font-size: 12px; color: var(--muted); }
 .lat.good { color: var(--ok); }
@@ -792,9 +792,11 @@ textarea { resize: vertical; min-height: 62px; }
   .stat { padding: 11px 13px 12px; }
   .stat strong { font-size: 22px; }
   .brand-text p { max-width: 210px; }
-  .device-table .col-seen { display: none; }
-  .device-table thead th, .device-table tbody td { padding: 9px 10px; }
-  .device-name, .device-sub { max-width: 128px; }
+  .device-table .col-seen, .device-table .col-go { display: none; }
+  .device-table thead th, .device-table tbody td { padding: 9px 7px; }
+  .device-table .col-addr .ip { font-size: 11px; }
+  .badge.off { display: none; }
+  .device-name, .device-sub { max-width: 150px; }
   .toolbar { padding: 10px; }
   .toolbar-right select { flex: 1 1 auto; }
   .drawer { width: 100%; border-left: 0; }

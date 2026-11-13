@@ -491,7 +491,7 @@ function rowHtml(device) {
     .map((port) => `<span class="chip" title="${esc(portTitle(device, port))}">${esc(portLabel(device, port))}</span>`)
     .join('');
   const more = ports.length > 4 ? `<span class="chip more">+${ports.length - 4}</span>` : '';
-  const services = chips || more ? chips + more : '<span class="chip empty">none</span>';
+  const services = chips || more ? chips + more : '<span class="chip blank">none</span>';
 
   const latency = device.rtt_ms;
   const latencyClass = latency == null ? 'none' : latency < 25 ? 'good' : latency < 120 ? 'warn' : 'bad';
@@ -519,7 +519,7 @@ function renderFooter() {
   $('#version').textContent = state.version;
   if (state.host) {
     const bits = [state.host.name, state.host.system];
-    if (state.host.android) bits.push('Android');
+    if (state.host.android && state.host.system !== 'Android') bits.push('Android');
     $('#foot-host').textContent = bits.filter(Boolean).join(' · ');
   } else {
     $('#foot-host').textContent = '';
@@ -619,7 +619,7 @@ function renderDrawerStats(deviceArg) {
   const mdns = (device.mdns_services || [])
     .map((service) => `<span class="chip" title="mDNS service">${esc(service)}</span>`)
     .join('');
-  $('#drawer-services').innerHTML = services + mdns || '<span class="chip empty">no services seen</span>';
+  $('#drawer-services').innerHTML = services + mdns || '<span class="chip blank">no services seen</span>';
 
   const advertised = [];
   const ssdp = device.ssdp || {};
