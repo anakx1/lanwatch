@@ -46,10 +46,11 @@ lanwatch scan -p 22,80,443,8009 --deep --verbose
 
 ## What a scan does
 
-A scan runs in two phases. First the fast sweep finds live hosts; then the
-name/vendor collectors enrich what was found. Every collector reports its own
-status (`ok`, `empty`, `skipped`, `unavailable`, `error`) so an empty result is
-never confused with a working one.
+A scan runs in three phases: a fast ICMP **sweep** finds live hosts, a **probe**
+port-scans them (plus silent hosts in `--deep` mode), and a **names** phase
+enriches what was found. Every collector reports its own status (`ok`, `empty`,
+`skipped`, `unavailable`, `error`) so an empty result is never confused with a
+working one.
 
 | Collector | What it does | Notes |
 | --- | --- | --- |
