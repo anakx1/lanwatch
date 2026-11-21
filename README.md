@@ -2,11 +2,12 @@
 
 Discover the devices on your LAN and watch them live in a browser.
 
-`lanwatch` is a **zero-dependency** Python tool: one process, one JSON state
-file, and a small web dashboard served by the standard library. It combines
-active probing (ICMP sweep, TCP port scan) with passive sources (ARP/neighbour
-table, mDNS, SSDP/UPnP, NetBIOS, reverse DNS) and tells you honestly which of
-them actually worked on your network.
+`lanwatch` is a **zero-dependency** Python tool: one process, one JSON
+inventory, a SQLite history file, and a small web dashboard served by the
+standard library. It combines active probing (ICMP sweep, TCP port scan, web
+fingerprinting) with passive sources (ARP/neighbour table, mDNS, SSDP/UPnP,
+NetBIOS, reverse DNS) and tells you honestly which of them actually worked on
+your network.
 
 ```
 $ lanwatch
@@ -225,8 +226,9 @@ The `scans` table stores the network, start/finish times, duration, host and
 device counts, and a stopped/error flag. `scan_devices` stores the snapshot of
 each device seen in that scan, so per-device presence and services are
 available even after the device disappears from the inventory. History is
-capped at the newest 500 scans to keep the database small; SQLite is part of
-the Python standard library, so this adds no dependency.
+shared across networks — each row records its scanned subnet — and is capped at
+the newest 500 scans to keep the database small. SQLite is part of the Python
+standard library, so this adds no dependency.
 
 ## Running on Android / Termux
 
@@ -257,7 +259,7 @@ On a normal Linux machine all collectors usually work, with or without root.
 ## Tests and development
 
 ```bash
-python3 -m unittest discover -s tests -t .   # 80 tests
+python3 -m unittest discover -s tests -t .   # 141 tests
 ruff check .
 mypy
 ```
@@ -272,12 +274,13 @@ lanwatch/
   cli.py              argparse commands and table rendering
   discovery.py        scan engine, options, event bus
   history.py          SQLite scan history and trends
-  collectors.py       ICMP, ARP, TCP, mDNS, SSDP, NBNS, rDNS primitives
+  collectors.py       ICMP, ARP, TCP, HTTP, mDNS, SSDP, NBNS, rDNS primitives
   dnsparse.py         minimal DNS packet codec (no dnspython)
-  netif.py            interface detection and subnet resolution
+  fingerprint.py      device kind, confidence and evidence from signals
+  netif.py            interface detection, gateways and subnet resolution
   model.py            Device model, merge rules, port names
   oui.py              MAC normalization and vendor database
-  store.py            JSON persistence, offline marking, CSV export
+  store.py            per-network JSON persistence, offline marking, CSV export
   web.py              stdlib HTTP server, routes, SSE
   static/             dashboard HTML/CSS/JS
 tests/                unittest suite with a mocked scan fixture
