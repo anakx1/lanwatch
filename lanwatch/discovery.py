@@ -8,12 +8,14 @@ import os
 import platform
 import queue
 import re
+import sqlite3
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from . import __version__, collectors, netif, oui
+from .history import HistoryStore, default_history_path
 from .model import Device, normalize_ip
 from .store import Store
 
@@ -175,8 +177,15 @@ def _clamp_float(value: object, low: float, high: float, name: str) -> float:
 class ScanEngine:
     """Owns the inventory, runs scans in a background thread and emits events."""
 
-    def __init__(self, store: Store, options: ScanOptions | None = None) -> None:
+    def __init__(
+        self,
+        store: Store,
+        options: ScanOptions | None = None,
+        history: HistoryStore | None = None,
+    ) -> None:
         self.store = store
+        self.history = history or HistoryStore(default_history_path(store.path))
+        self.history_error: str | None = None
         self.bus = EventBus()
         self.options = options or ScanOptions()
         self._lock = threading.RLock()
@@ -324,6 +333,7 @@ class ScanEngine:
         data["collectors"] = self.collectors_dict()
         data["interfaces"] = [iface.to_dict() for iface in self._interfaces]
         data["version"] = __version__
+        data["history"] = {"path": str(self.history.path), "error": self.history_error}
         data["host"] = {
             "name": platform.node(),
             "system": platform.system(),
@@ -906,8 +916,36 @@ class ScanEngine:
         # Publish and persist before clearing "running": observers that wait
         # for the scan to stop must not race the final write.
         self.store.save()
+        self._record_history(state, seen, stopped)
         self._emit("scan.finished", state=state, counts=self.store.counts(), stopped=stopped)
         self._set_state(running=False)
+
+    def _record_history(
+        self, state: dict[str, Any], seen: set[str], stopped: bool
+    ) -> None:
+        """Write a completed scan to SQLite without ever failing the scan."""
+        network = self.store.network or {}
+        with self.store.lock:
+            devices = [
+                self.store.devices[ip]
+                for ip in sorted(seen)
+                if ip in self.store.devices
+            ]
+        try:
+            self.history.record_scan(
+                devices,
+                started_at=float(state.get("started_at") or time.time()),
+                finished_at=float(state.get("finished_at") or time.time()),
+                duration_s=state.get("duration_s"),
+                subnet=network.get("cidr") or state.get("subnet"),
+                interface=network.get("interface"),
+                hosts_total=int(state.get("hosts_total") or 0),
+                hosts_up=int(network.get("hosts_up") or len(seen)),
+                stopped=stopped,
+            )
+            self.history_error = None
+        except (OSError, sqlite3.Error) as exc:
+            self.history_error = str(exc)
 
 
 def _collect_banners(open_map: dict[str, list[int]]) -> dict[str, dict[str, str]]:

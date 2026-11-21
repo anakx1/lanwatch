@@ -79,6 +79,7 @@ const state = {
   autoTimer: null,
   renderQueued: false,
   search: '',
+  history: { scans: [], path: '', error: null },
   prefs: { showOffline: true, sort: 'ip', autoScan: false, autoInterval: 60 },
 };
 
@@ -192,6 +193,10 @@ function applySnapshot(data) {
   state.host = data.host || null;
   state.version = data.version || state.version;
   state.statePath = data.state_path || '';
+  if (data.history) {
+    state.history.path = data.history.path || '';
+    state.history.error = data.history.error || null;
+  }
   renderAll();
 }
 
@@ -245,6 +250,7 @@ function handleEvent(event) {
         const online = [...state.devices.values()].filter((d) => d.online).length;
         toast(`Scan complete · ${plural(online, 'device')} online`);
       }
+      loadHistory();
       break;
     case 'scan.error':
       toast(event.error || 'Scan failed', 'error');
@@ -275,6 +281,7 @@ function renderAll() {
   renderScan();
   renderCollectors();
   renderTable();
+  renderHistory();
   renderFooter();
 }
 
@@ -469,6 +476,61 @@ function renderTable() {
     : 'no scan yet';
   const filtering = list.length !== total ? `${list.length} of ${plural(total, 'device')}` : plural(total, 'device');
   $('#table-hint').textContent = `${filtering} shown · ${online} online · ${stamp}${state.scan.running ? ' · scanning…' : ''}`;
+}
+
+function renderHistory() {
+  const scans = state.history.scans || [];
+  const spark = $('#history-spark');
+  const count = $('#history-count');
+  const hint = $('#history-hint');
+
+  count.textContent = scans.length ? `${scans.length} recent` : '0 scans';
+  if (state.history.error) {
+    $('#history-sub').textContent = `History unavailable · ${state.history.error}`;
+  } else if (scans.length) {
+    $('#history-sub').textContent = `Last scan ${ago(scans[0].finished_at)} · recorded automatically`;
+  } else {
+    $('#history-sub').textContent = 'No scans recorded yet';
+  }
+
+  const chronological = scans.slice().reverse();
+  const max = Math.max(1, ...chronological.map((scan) => Number(scan.devices_found) || 0));
+  const bars = [];
+  for (let index = chronological.length; index < 12; index += 1) {
+    bars.push('<span class="spark-bar spark-bar--empty"></span>');
+  }
+  for (const scan of chronological) {
+    const found = Number(scan.devices_found) || 0;
+    const height = Math.max(4, Math.round((found / max) * 100));
+    const title = `${absolute(scan.finished_at)} · ${plural(found, 'device')} found`;
+    bars.push(`<span class="spark-bar" style="height:${height}%" title="${esc(title)}"></span>`);
+  }
+  spark.innerHTML = chronological.length
+    ? bars.join('')
+    : '<span class="spark-empty">History appears after the first scan</span>';
+
+  if (!scans.length) {
+    $('#history-rows').innerHTML =
+      '<tr><td class="history-empty" colspan="6">Run a scan to start the timeline.</td></tr>';
+  } else {
+    $('#history-rows').innerHTML = scans
+      .map((scan) => {
+        const status = scan.error ? 'error' : scan.stopped ? 'stopped' : 'ok';
+        const found = Number(scan.devices_found) || 0;
+        const up = Number(scan.hosts_up) || 0;
+        return `<tr title="${esc(absolute(scan.finished_at))}">
+          <td><span data-ts="${Number(scan.finished_at) || 0}">${ago(scan.finished_at)}</span></td>
+          <td class="mono col-history-network">${esc(scan.subnet || '—')}</td>
+          <td class="num">${found}</td>
+          <td class="num col-history-up">${up}</td>
+          <td class="col-history-duration">${formatDuration(scan.duration_s)}</td>
+          <td><span class="status ${status}">${status}</span></td>
+        </tr>`;
+      })
+      .join('');
+  }
+
+  hint.textContent = state.history.path ? `history ${state.history.path}` : '';
 }
 
 function comparator(sort) {
@@ -1173,7 +1235,10 @@ function bindEvents() {
   });
 
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) loadState();
+    if (!document.hidden) {
+      loadState();
+      loadHistory();
+    }
   });
 }
 
@@ -1189,6 +1254,18 @@ async function loadState() {
     setSync(false);
     toast(`Cannot reach lanwatch: ${error.message}`, 'error');
   }
+}
+
+async function loadHistory() {
+  try {
+    const data = await api('/api/history?limit=12');
+    state.history.scans = data.scans || [];
+    state.history.path = data.path || state.history.path;
+    state.history.error = data.error || null;
+  } catch (error) {
+    state.history.error = error.message || 'unavailable';
+  }
+  renderHistory();
 }
 
 function tick() {
@@ -1209,7 +1286,7 @@ async function init() {
   applyPrefs();
   bindEvents();
   setupAutoScan();
-  await loadState();
+  await Promise.all([loadState(), loadHistory()]);
   connectEvents();
   setInterval(tick, 1000);
 }

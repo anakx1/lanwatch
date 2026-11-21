@@ -111,9 +111,50 @@ class WebTests(unittest.TestCase):
         data = self.state()
         for key in ("state", "devices", "network", "collectors", "options", "interfaces"):
             self.assertIn(key, data)
+        self.assertIn("history", data)
+        self.assertIn("path", data["history"])
         self.assertFalse(data["state"]["running"])
         names = [iface["name"] for iface in data["interfaces"]]
         self.assertNotIn("lo", names)
+
+    def test_history_endpoint(self) -> None:
+        status, _, body = self.request("/api/history")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["scans"], [])
+        self.assertIn("history.db", data["path"])
+
+        self.start_scan()
+        status, _, body = self.request("/api/history?limit=5")
+        self.assertEqual(status, 200)
+        data = json.loads(body)
+        self.assertEqual(len(data["scans"]), 1)
+        scan = data["scans"][0]
+        self.assertEqual(scan["subnet"], "10.0.0.0/24")
+        self.assertEqual(scan["devices_found"], 4)
+        self.assertFalse(scan["stopped"])
+
+        for query in ("limit=0", "limit=201", "limit=abc"):
+            status, _, body = self.request(f"/api/history?{query}")
+            self.assertEqual(status, 400, query)
+            self.assertFalse(json.loads(body)["ok"])
+
+    def test_history_endpoint_reports_read_errors(self) -> None:
+        self.engine.history.recent = unittest.mock.Mock(side_effect=OSError("read-only"))
+        status, _, body = self.request("/api/history")
+        self.assertEqual(status, 500)
+        data = json.loads(body)
+        self.assertFalse(data["ok"])
+        self.assertIn("history unavailable", data["error"])
+
+    def test_index_includes_history_panel(self) -> None:
+        status, _, body = self.request("/")
+        self.assertEqual(status, 200)
+        text = body.decode()
+        self.assertIn("Scan history", text)
+        self.assertIn('id="history-rows"', text)
+        self.assertIn('id="history-spark"', text)
 
     def test_mutations_require_header_and_matching_origin(self) -> None:
         status, _, _ = self.request("/api/scan", "POST", {})

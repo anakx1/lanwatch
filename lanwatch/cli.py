@@ -7,17 +7,20 @@ import json
 import os
 import queue
 import shutil
+import sqlite3
 import sys
 import time
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 from . import __version__, collectors, netif, web
 from .discovery import ScanEngine, ScanOptions
-from .model import PORT_NAMES, Device
+from .history import HistoryStore, default_history_path
+from .model import PORT_NAMES, Device, normalize_ip
 from .store import Store
 
-COMMANDS = {"scan", "watch", "devices", "web", "label", "forget", "version"}
+COMMANDS = {"scan", "watch", "devices", "history", "web", "label", "forget", "version"}
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +135,72 @@ def render_table(devices: list[Device], show_offline: bool = True, verbose: bool
     lines.append(
         _style(f"{online} online · {len(rows) - online} offline · {len(rows)} known", "2")
     )
+    return "\n".join(lines)
+
+
+def _history_time(timestamp: object) -> str:
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(str(timestamp))))
+    except (TypeError, ValueError, OSError):
+        return "—"
+
+
+def _duration_text(value: object) -> str:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return "—"
+    seconds = float(value)
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    rest = int(seconds % 60)
+    if minutes < 60:
+        return f"{minutes}m {rest}s"
+    return f"{minutes // 60}h {minutes % 60}m"
+
+
+def _history_status(scan: dict[str, Any]) -> str:
+    if scan.get("error"):
+        return "error"
+    if scan.get("stopped"):
+        return "stopped"
+    return "ok"
+
+
+def render_history(scans: list[dict[str, Any]]) -> str:
+    if not scans:
+        return "No scan history yet.\nHistory is recorded after each completed scan."
+    header = f"{'WHEN':<16} {'NETWORK':<20} {'FOUND':>5} {'UP':>4} {'DURATION':>9} {'STATUS':<8}"
+    lines = [_style(header, "2")]
+    colors = {"ok": "32", "stopped": "33", "error": "31"}
+    for scan in scans:
+        status = _history_status(scan)
+        when = _history_time(scan.get("finished_at"))
+        network = _truncate(str(scan.get("subnet") or "—"), 20)
+        found = int(scan.get("devices_found") or 0)
+        up = int(scan.get("hosts_up") or 0)
+        duration = _duration_text(scan.get("duration_s"))
+        status_cell = _style(f"{status:<8}", colors[status])
+        lines.append(f"{when:<16} {network:<20} {found:>5} {up:>4} {duration:>9} {status_cell}")
+    return "\n".join(lines)
+
+
+def render_device_history(ip: str, visits: list[dict[str, Any]]) -> str:
+    if not visits:
+        return (
+            f"No history for {ip}.\n"
+            "The address will appear here after a scan finds it."
+        )
+    header = f"{'WHEN':<16} {'NAME':<24} {'NETWORK':<20} {'LATENCY':>8} {'SERVICES'}"
+    lines = [_style(header, "2")]
+    for visit in visits:
+        when = _history_time(visit.get("finished_at"))
+        name = _truncate(str(visit.get("name") or visit.get("hostname") or "—"), 24)
+        network = _truncate(str(visit.get("subnet") or "—"), 20)
+        latency = visit.get("latency_ms")
+        latency_text = f"{float(latency):.0f} ms" if isinstance(latency, (int, float)) else "—"
+        ports = visit.get("ports") or []
+        services = ", ".join(_service_label(int(port)) for port in ports) or "—"
+        lines.append(f"{when:<16} {name:<24} {network:<20} {latency_text:>8} {services}")
     return "\n".join(lines)
 
 
@@ -293,6 +362,53 @@ def cmd_devices(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_history(args: argparse.Namespace) -> int:
+    store = _open_store(args)
+    history = HistoryStore(default_history_path(store.path))
+    limit = max(1, min(200, int(args.limit)))
+    try:
+        if args.device:
+            address = normalize_ip(args.device)
+            visits = history.device_history(address, limit)
+            if args.json:
+                print(
+                    json.dumps(
+                        {
+                            "ip": address,
+                            "visits": visits,
+                            "history_path": str(history.path),
+                        },
+                        indent=2,
+                        default=str,
+                    )
+                )
+                return 0
+            print(render_device_history(address, visits))
+            if visits:
+                print()
+                print(_style(f"{len(visits)} visit(s) · history {history.path}", "2"))
+            return 0
+
+        scans = history.recent(limit)
+        if args.json:
+            print(
+                json.dumps(
+                    {"scans": scans, "history_path": str(history.path)},
+                    indent=2,
+                    default=str,
+                )
+            )
+            return 0
+        print(render_history(scans))
+        if scans:
+            print()
+            print(_style(f"{len(scans)} scan(s) · history {history.path}", "2"))
+        return 0
+    except (OSError, sqlite3.Error) as exc:
+        print(f"lanwatch: cannot read scan history: {exc}", file=sys.stderr)
+        return 1
+
+
 def cmd_web(args: argparse.Namespace) -> int:
     store = _open_store(args)
     engine = ScanEngine(store, _build_options(args))
@@ -383,6 +499,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  lanwatch web                  open the live dashboard\n"
             "  lanwatch watch -i 60          rescan every minute\n"
             "  lanwatch devices --all        list the saved inventory\n"
+            "  lanwatch history              show recent scans\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -403,6 +520,14 @@ def build_parser() -> argparse.ArgumentParser:
     devices.add_argument("--csv", action="store_true", help="print CSV")
     devices.add_argument("--verbose", "-v", action="store_true", help="show names, MACs and notes")
     devices.set_defaults(func=cmd_devices)
+
+    history_parser = subparsers.add_parser(
+        "history", parents=[common], help="show recorded scan history"
+    )
+    history_parser.add_argument("--limit", type=int, default=20, help="rows to show (default 20)")
+    history_parser.add_argument("--device", metavar="IP", help="show history for one device")
+    history_parser.add_argument("--json", action="store_true", help="print JSON")
+    history_parser.set_defaults(func=cmd_history)
 
     web_parser = subparsers.add_parser("web", parents=[common], help="serve the web dashboard")
     web_parser.add_argument("--host", default="127.0.0.1", help="bind address (default: loopback)")
@@ -455,6 +580,8 @@ def _normalize_argv(argv: list[str]) -> list[str]:
         "--interval",
         "-i",
         "--notes",
+        "--limit",
+        "--device",
     }
     index = 0
     while index < len(argv):

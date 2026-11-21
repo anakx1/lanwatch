@@ -167,6 +167,33 @@
 
         <p class="hint" id="table-hint"></p>
       </section>
+
+      <section class="history" aria-label="Scan history">
+        <div class="history-head">
+          <div>
+            <h2>Scan history</h2>
+            <p id="history-sub">No scans recorded yet</p>
+          </div>
+          <span class="history-count" id="history-count">0 scans</span>
+        </div>
+        <div class="spark" id="history-spark" aria-hidden="true"></div>
+        <div class="table-wrap">
+          <table class="history-table" id="history-table">
+            <thead>
+              <tr>
+                <th>When</th>
+                <th class="col-history-network">Network</th>
+                <th class="num">Found</th>
+                <th class="col-history-up num">Up</th>
+                <th class="col-history-duration">Duration</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="history-rows"></tbody>
+          </table>
+        </div>
+        <p class="hint" id="history-hint"></p>
+      </section>
     </main>
 
     <footer class="foot">
