@@ -31,13 +31,11 @@
       </div>
 
       <div class="topbar-right">
-        <button class="net-chip" id="net-chip" type="button" title="Open scan settings">
+        <button class="net-chip" id="net-chip" type="button" title="Switch network" aria-haspopup="dialog">
           <span class="net-dot" id="net-dot"></span>
           <span class="net-cidr mono" id="net-cidr">detecting…</span>
           <span class="net-if" id="net-if"></span>
-          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-            <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.7 1.7 0 0 0-1.87-.34 1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09A1.7 1.7 0 0 0 9 19.36a1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.64 15a1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.64 9a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 9 4.64a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.7 1.7 0 0 0 19.36 9c.23.6.8 1 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1z"/>
-          </svg>
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
         </button>
 
         <div class="btn-group">
@@ -230,6 +228,14 @@
         <h3>Services</h3>
         <div class="chips" id="drawer-services"></div>
       </section>
+      <section id="drawer-fp-section" hidden>
+        <h3>Why we think so</h3>
+        <ul class="evidence" id="drawer-evidence"></ul>
+      </section>
+      <section id="drawer-web-section" hidden>
+        <h3>Web interface</h3>
+        <dl class="kv" id="drawer-web"></dl>
+      </section>
       <section id="drawer-adv-section" hidden>
         <h3>Advertised</h3>
         <dl class="kv" id="drawer-adv"></dl>
@@ -267,6 +273,7 @@
         </label>
         <div class="check-grid">
           <label class="check"><input type="checkbox" id="opt-deep"><span>Probe hosts that ignore ping</span></label>
+          <label class="check"><input type="checkbox" id="opt-http" checked><span>Web fingerprint (titles, certs)</span></label>
           <label class="check"><input type="checkbox" id="opt-mdns" checked><span>mDNS / Bonjour</span></label>
           <label class="check"><input type="checkbox" id="opt-ssdp" checked><span>SSDP / UPnP</span></label>
           <label class="check"><input type="checkbox" id="opt-nbns" checked><span>NetBIOS names</span></label>
@@ -286,6 +293,22 @@
         <button class="btn primary" type="submit">Save &amp; scan</button>
       </div>
     </form>
+  </dialog>
+
+  <dialog class="dialog" id="networks" aria-labelledby="networks-title">
+    <div class="dialog-head">
+      <h2 id="networks-title">Networks</h2>
+      <button class="icon-btn" type="button" id="networks-close" aria-label="Close networks">×</button>
+    </div>
+    <div class="dialog-body">
+      <p class="dialog-note">Each network keeps its own device list, so a router from another Wi-Fi never shows up here. Switching is disabled while a scan is running.</p>
+      <ul class="net-list" id="net-list"></ul>
+      <label class="check" id="net-archived-toggle"><input type="checkbox" id="net-show-archived"><span>Show archived</span></label>
+    </div>
+    <div class="dialog-actions">
+      <button class="btn ghost" type="button" id="networks-settings">Scan settings…</button>
+      <button class="btn primary" type="button" id="networks-done">Done</button>
+    </div>
   </dialog>
 
   <div class="toasts" id="toasts" aria-live="polite"></div>

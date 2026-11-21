@@ -14,6 +14,8 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import fingerprint
+
 # Where a hostname came from, best source wins.
 HOSTNAME_RANK = {"mdns": 5, "ssdp": 4, "nbns": 3, "pcb": 3, "rdns": 2}
 
@@ -93,6 +95,8 @@ class Device:
     mdns_services: list[str] = field(default_factory=list)
     ssdp: dict[str, str] = field(default_factory=dict)
     nbns_name: str | None = None
+    ttl: int | None = None
+    web: dict[str, dict[str, str]] = field(default_factory=dict)
     sources: list[str] = field(default_factory=list)
     label: str | None = None
     notes: str = ""
@@ -144,6 +148,11 @@ class Device:
         for key, value in other.ssdp.items():
             if value and not self.ssdp.get(key):
                 self.ssdp[key] = value
+        if other.ttl:
+            self.ttl = other.ttl
+        for port, info in other.web.items():
+            if info:
+                self.web[str(port)] = {**self.web.get(str(port), {}), **info}
         self.add_source(*other.sources)
         if other.notes and not self.notes:
             self.notes = other.notes
@@ -159,6 +168,10 @@ class Device:
 
     # -- presentation ----------------------------------------------------
 
+    def identity(self) -> fingerprint.Identity:
+        """Fingerprint this device from everything collected so far."""
+        return fingerprint.identify(self)
+
     @property
     def display_name(self) -> str:
         for candidate in (
@@ -166,48 +179,38 @@ class Device:
             self.hostname,
             self.nbns_name,
             self.ssdp.get("friendlyName"),
-            self.vendor,
         ):
             if candidate:
                 return str(candidate)
-        return "Unknown device"
+        return self._fallback_name(self.identity())
+
+    def _fallback_name(self, identity: fingerprint.Identity) -> str:
+        return identity.name or self.vendor or "Unknown device"
 
     def guess_kind(self) -> str:
-        """Coarse device category used for the dashboard icon."""
-        ports = set(self.ports)
-        haystack = " ".join(
-            [*self.mdns_services, *self.ssdp.values(), self.vendor or ""]
-        ).lower()
+        """Device category used for the dashboard icon (see :mod:`fingerprint`)."""
         if self.is_self:
             return "self"
-        if self.is_gateway:
-            return "router"
-        if 631 in ports or 9100 in ports or "ipp" in haystack or "printer" in haystack:
-            return "printer"
-        if "googlecast" in haystack or "chromecast" in haystack:
-            return "tv"
-        if "airplay" in haystack or 7000 in ports or 8009 in ports:
-            return "tv" if ("tv" in haystack or "appletv" in haystack) else "media"
-        if "mediarenderer" in haystack or "mediaserver" in haystack:
-            return "media"
-        if 32400 in ports or 548 in ports or (445 in ports and 22 in ports):
-            return "nas"
-        if 3389 in ports or (139 in ports and 445 in ports):
-            return "computer"
-        if {"rtsp", "onvif"} & {part.strip("_") for part in self.mdns_services}:
-            return "camera"
-        if any(p in ports for p in (554, 9000)):
-            return "media"
-        if "raspberry" in haystack or "synology" in haystack or "qnap" in haystack:
-            return "nas"
-        if "espressif" in haystack or 1883 in ports or 8883 in ports:
-            return "iot"
-        return "device"
+        return self.identity().kind
 
     def to_dict(self) -> dict[str, Any]:
+        identity = self.identity()
+        name = next(
+            (
+                str(candidate)
+                for candidate in (
+                    self.label,
+                    self.hostname,
+                    self.nbns_name,
+                    self.ssdp.get("friendlyName"),
+                )
+                if candidate
+            ),
+            None,
+        ) or self._fallback_name(identity)
         return {
             "ip": self.ip,
-            "name": self.display_name,
+            "name": name,
             "label": self.label,
             "notes": self.notes,
             "hostname": self.hostname,
@@ -228,7 +231,10 @@ class Device:
             "seen_count": self.seen_count,
             "is_self": self.is_self,
             "is_gateway": self.is_gateway,
-            "kind": self.guess_kind(),
+            "kind": "self" if self.is_self else identity.kind,
+            "ttl": self.ttl,
+            "web": self.web,
+            "identity": identity.to_dict(),
         }
 
     @classmethod
@@ -251,6 +257,13 @@ class Device:
         ssdp = raw.get("ssdp") or {}
         if isinstance(ssdp, dict):
             device.ssdp = {str(k): str(v) for k, v in ssdp.items()}
+        ttl = raw.get("ttl")
+        device.ttl = int(ttl) if isinstance(ttl, int) and not isinstance(ttl, bool) and ttl > 0 else None
+        web = raw.get("web")
+        if isinstance(web, dict):
+            for port, info in web.items():
+                if isinstance(info, dict):
+                    device.web[str(port)] = {str(k): str(v) for k, v in info.items() if v}
         device.sources = [str(s) for s in raw.get("sources") or []]
         device.label = raw.get("label") or None
         device.notes = str(raw.get("notes") or "")

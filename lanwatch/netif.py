@@ -362,3 +362,59 @@ def primary_address() -> str | None:
             probe.close()
     except OSError:
         return None
+
+
+def default_gateway(network: ipaddress.IPv4Network | None = None) -> str | None:
+    """Return the default-route gateway, or ``None`` when it cannot be read.
+
+    Android apps usually cannot read the routing table, so callers must keep a
+    fallback (see :func:`guess_gateway`).  When *network* is given, a gateway
+    outside it is ignored.
+    """
+    candidates: list[str] = []
+    try:
+        with open("/proc/net/route", encoding="utf-8", errors="replace") as handle:
+            candidates.extend(_gateways_from_proc_route(handle.read()))
+    except OSError:
+        pass
+    if not candidates:
+        try:
+            result = subprocess.run(
+                ["ip", "route", "show", "default"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            candidates.extend(_gateways_from_ip_route(result.stdout))
+        except (OSError, subprocess.SubprocessError):
+            pass
+    for candidate in candidates:
+        try:
+            address = ipaddress.ip_address(candidate)
+        except ValueError:
+            continue
+        if network is None or address in network:
+            return candidate
+    return None
+
+
+def _gateways_from_proc_route(text: str) -> list[str]:
+    found: list[str] = []
+    for line in text.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 4 or parts[1] != "00000000":
+            continue
+        try:
+            flags = int(parts[3], 16)
+            raw = int(parts[2], 16)
+        except ValueError:
+            continue
+        if not flags & 0x2 or raw == 0:  # RTF_GATEWAY
+            continue
+        found.append(str(ipaddress.ip_address(struct.pack("<I", raw))))
+    return found
+
+
+def _gateways_from_ip_route(text: str) -> list[str]:
+    return re.findall(r"^default\s+via\s+(\d{1,3}(?:\.\d{1,3}){3})", text, flags=re.MULTILINE)

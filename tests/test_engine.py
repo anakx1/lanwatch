@@ -191,7 +191,7 @@ class EngineTests(unittest.TestCase):
         television = devices["10.0.0.9"]
         self.assertTrue(television.online)
         self.assertEqual(television.ssdp.get("friendlyName"), "Living Room TV")
-        self.assertEqual(television.guess_kind(), "media")
+        self.assertEqual(television.guess_kind(), "tv")  # Bravia + "TV" outranks generic UPnP renderer
 
         collectors_state = self.engine.collectors_dict()
         self.assertEqual(collectors_state["icmp"]["status"], "ok")

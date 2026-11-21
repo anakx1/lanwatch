@@ -246,6 +246,7 @@ def _build_options(args: argparse.Namespace) -> ScanOptions:
         concurrency=getattr(args, "concurrency", 64),
         max_hosts=getattr(args, "max_hosts", netif.DEFAULT_MAX_HOSTS),
         deep=getattr(args, "deep", False),
+        http=not getattr(args, "no_http", False),
         mdns=not getattr(args, "no_mdns", False),
         ssdp=not getattr(args, "no_ssdp", False),
         nbns=not getattr(args, "no_nbns", False),
@@ -471,6 +472,9 @@ def _add_scan_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--no-mdns", action="store_true", help="skip mDNS-SD discovery")
     parser.add_argument("--no-ssdp", action="store_true", help="skip SSDP/UPnP discovery")
     parser.add_argument("--no-nbns", action="store_true", help="skip NetBIOS name queries")
+    parser.add_argument(
+        "--no-http", action="store_true", help="skip web-page fingerprinting (titles, headers, certs)"
+    )
     parser.add_argument("--no-rdns", action="store_true", help="skip reverse DNS")
     parser.add_argument("--all", action="store_true", help="include offline devices in the table")
     parser.add_argument("--verbose", "-v", action="store_true", help="show names, MACs and notes")
@@ -539,6 +543,7 @@ def build_parser() -> argparse.ArgumentParser:
     web_parser.add_argument("--no-mdns", action="store_true")
     web_parser.add_argument("--no-ssdp", action="store_true")
     web_parser.add_argument("--no-nbns", action="store_true")
+    web_parser.add_argument("--no-http", action="store_true")
     web_parser.add_argument("--no-rdns", action="store_true")
     web_parser.set_defaults(func=cmd_web)
 
