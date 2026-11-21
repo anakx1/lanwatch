@@ -13,6 +13,7 @@ const COLLECTORS = [
   ['icmp', 'ICMP'],
   ['arp', 'ARP'],
   ['tcp', 'TCP'],
+  ['http', 'HTTP'],
   ['mdns', 'mDNS'],
   ['ssdp', 'SSDP'],
   ['nbns', 'NBNS'],
@@ -32,13 +33,19 @@ const ICONS = {
     '<rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/>',
   camera:
     '<path d="M4 8h3l2-2.5h6L17 8h3v11H4z"/><circle cx="12" cy="13" r="3"/>',
+  phone:
+    '<rect x="7" y="2.5" width="10" height="19" rx="2.5"/><path d="M11 18.5h2"/>',
+  speaker:
+    '<rect x="6" y="3" width="12" height="18" rx="3"/><circle cx="12" cy="14.5" r="3"/><circle cx="12" cy="7.5" r="1"/>',
+  console:
+    '<rect x="2.5" y="8" width="19" height="9" rx="4.5"/><path d="M7.5 11v3M6 12.5h3M15.5 11.5h.01M17.5 13.5h.01"/>',
   iot:
     '<circle cx="12" cy="12" r="3"/><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.4 5.4l1.4 1.4M17.2 17.2l1.4 1.4M18.6 5.4l-1.4 1.4M6.8 17.2l-1.4 1.4"/>',
   device:
     '<rect x="6" y="6" width="12" height="12" rx="2.5"/><path d="M9.5 2.5v3M14.5 2.5v3M9.5 18.5v3M14.5 18.5v3M2.5 9.5h3M2.5 14.5h3M18.5 9.5h3M18.5 14.5h3"/>',
 };
 
-const ICON_ALIASES = { self: 'computer', phone: 'computer', '': 'device' };
+const ICON_ALIASES = { self: 'computer', '': 'device' };
 const CHEVRON =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>';
 
@@ -58,6 +65,9 @@ const state = {
   scan: { running: false, phase: 'idle', message: 'ready', done: 0, total: 0, hosts_total: 0, found: 0 },
   collectors: {},
   network: null,
+  networks: [],
+  activeNetwork: null,
+  showArchived: false,
   interfaces: [],
   options: {},
   host: null,
@@ -175,6 +185,8 @@ function applySnapshot(data) {
   if (data.state) state.scan = data.state;
   if (data.collectors) state.collectors = data.collectors;
   state.network = data.network || null;
+  state.networks = data.networks || [];
+  state.activeNetwork = data.active_network || null;
   state.interfaces = data.interfaces || [];
   state.options = data.options || {};
   state.host = data.host || null;
@@ -207,6 +219,13 @@ function handleEvent(event) {
       break;
     case 'network':
       state.network = event.network || state.network;
+      break;
+    case 'network.changed':
+      state.networks = event.networks || state.networks;
+      renderNetworks();
+      // The active inventory changed (scan on another network, or a switch from
+      // another browser tab): reload so the device list matches.
+      if ((state.activeNetwork && state.activeNetwork.id) !== event.active) loadState();
       break;
     case 'device':
       upsertDevice(event.device);
@@ -251,6 +270,7 @@ function queueRender() {
 
 function renderAll() {
   renderNetwork();
+  if ($('#networks') && $('#networks').open) renderNetworks();
   renderStats();
   renderScan();
   renderCollectors();
@@ -269,8 +289,12 @@ function renderNetwork() {
   const dot = $('#net-dot');
   const online = deviceList().filter((d) => d.online).length;
 
+  const active = state.activeNetwork;
+  const saved = state.networks.filter((n) => !n.archived).length;
+  const switchHint = saved > 1 ? `${saved} saved networks · ` : '';
+
   if (network) {
-    cidr.textContent = network.cidr || 'unknown subnet';
+    cidr.textContent = (active && active.label) || network.cidr || 'unknown subnet';
     const bits = [];
     if (network.interface) bits.push(network.interface);
     if (network.address) bits.push(network.address);
@@ -278,13 +302,18 @@ function renderNetwork() {
     const bitsTitle = [`Network ${network.cidr}`];
     if (network.gateway) bitsTitle.push(`gateway ${network.gateway}`);
     if (network.host_count) bitsTitle.push(`${network.host_count} addresses`);
-    bitsTitle.push('click to change scan settings');
-    $('#net-chip').title = bitsTitle.join(' · ');
+    bitsTitle.push('click to switch network');
+    $('#net-chip').title = switchHint + bitsTitle.join(' · ');
     $('#brand-sub').textContent = `${plural(online, 'device')} online on ${network.cidr}`;
+  } else if (active && active.cidr) {
+    cidr.textContent = active.label || active.cidr;
+    iface.textContent = '';
+    $('#net-chip').title = `${switchHint}not scanned yet · click to switch network`;
+    $('#brand-sub').textContent = `${plural(online, 'device')} online on ${active.cidr}`;
   } else {
     cidr.textContent = 'no network yet';
     iface.textContent = '';
-    $('#net-chip').title = 'Open scan settings';
+    $('#net-chip').title = 'Switch network';
     $('#brand-sub').textContent = 'LAN device discovery';
   }
 
@@ -470,10 +499,35 @@ function portTitle(device, port) {
   return banner ? `${label} · ${banner}` : label;
 }
 
+const KIND_LABELS = {
+  router: 'Router',
+  printer: 'Printer',
+  tv: 'TV',
+  media: 'Media device',
+  nas: 'NAS',
+  computer: 'Computer',
+  camera: 'Camera',
+  iot: 'Smart device',
+  phone: 'Phone / tablet',
+  speaker: 'Speaker',
+  console: 'Game console',
+};
+
+function kindLabel(device) {
+  const identity = device.identity;
+  if (!identity || !KIND_LABELS[identity.kind]) return '';
+  const label = KIND_LABELS[identity.kind];
+  if (identity.confidence >= 55) return label;
+  if (identity.confidence >= 25) return `maybe ${label.toLowerCase()}`;
+  return '';
+}
+
 function rowHtml(device) {
   const online = !!device.online;
   const name = device.name || device.hostname || 'Unknown device';
   const subBits = [];
+  const kindText = kindLabel(device);
+  if (kindText) subBits.push(kindText);
   if (device.vendor) subBits.push(device.vendor);
   else if (device.hostname && device.hostname !== name) subBits.push(device.hostname);
   if (device.mac) subBits.push(device.mac);
@@ -583,12 +637,18 @@ function renderDrawer(device) {
   else badges.push('<span class="badge off">offline</span>');
   if (device.is_gateway) badges.push('<span class="badge gw">gateway</span>');
   if (device.is_self) badges.push('<span class="badge self">this device</span>');
-  badges.push(`<span class="badge">${esc(device.kind || 'device')}</span>`);
+  badges.push(`<span class="badge">${esc(KIND_LABELS[device.kind] || device.kind || 'device')}${confidenceHtml(device)}</span>`);
   $('#drawer-badges').innerHTML = badges.join('');
 
   if (document.activeElement !== $('#drawer-label')) $('#drawer-label').value = device.label || '';
   if (document.activeElement !== $('#drawer-notes')) $('#drawer-notes').value = device.notes || '';
   renderDrawerStats(device);
+}
+
+function confidenceHtml(device) {
+  const identity = device.identity;
+  if (!identity || !identity.confidence || !KIND_LABELS[identity.kind]) return '';
+  return `<span class="conf">${identity.confidence}%</span>`;
 }
 
 function renderDrawerStats(deviceArg) {
@@ -602,7 +662,11 @@ function renderDrawerStats(deviceArg) {
   if (device.nbns_name && device.nbns_name !== device.hostname) identity.push(['NetBIOS', esc(device.nbns_name)]);
   if (device.mac) identity.push(['MAC address', `<span class="mono">${esc(device.mac)}</span>`]);
   if (device.vendor) identity.push(['Vendor', esc(device.vendor)]);
-  identity.push(['Category', esc(device.kind || 'device')]);
+  const fp = device.identity || {};
+  identity.push(['Category', `${esc(KIND_LABELS[device.kind] || device.kind || 'device')}${confidenceHtml(device)}`]);
+  if (fp.model) identity.push(['Model', esc(fp.model)]);
+  if (fp.os) identity.push(['OS guess', esc(fp.os)]);
+  if (device.ttl) identity.push(['TTL', String(device.ttl)]);
   identity.push(['Latency', device.rtt_ms == null ? '—' : `${Math.round(device.rtt_ms)} ms`]);
   identity.push(['First seen', `${esc(absolute(device.first_seen))} <span class="sub">${esc(ago(device.first_seen))}</span>`]);
   identity.push(['Last seen', `${esc(absolute(device.last_seen))} <span class="sub">${esc(ago(device.last_seen))}</span>`]);
@@ -621,12 +685,28 @@ function renderDrawerStats(deviceArg) {
     .join('');
   $('#drawer-services').innerHTML = services + mdns || '<span class="chip blank">no services seen</span>';
 
+  const evidence = fp.evidence || [];
+  $('#drawer-fp-section').hidden = evidence.length === 0;
+  $('#drawer-evidence').innerHTML = evidence.map((line) => `<li>${esc(line)}</li>`).join('');
+
+  const webRows = [];
+  const webLabels = { title: 'Title', server: 'Server', realm: 'Login realm', cert_cn: 'Certificate', cert_org: 'Cert. organisation', powered_by: 'Powered by' };
+  Object.keys(device.web || {}).sort((x, y) => Number(x) - Number(y)).forEach((port) => {
+    const page = device.web[port] || {};
+    Object.keys(webLabels).forEach((key) => {
+      if (page[key]) webRows.push([`:${port} ${webLabels[key]}`, esc(page[key])]);
+    });
+  });
+  $('#drawer-web-section').hidden = webRows.length === 0;
+  $('#drawer-web').innerHTML = webRows.map(([key, value]) => `<dt>${esc(key)}</dt><dd>${value}</dd>`).join('');
+
   const advertised = [];
   const ssdp = device.ssdp || {};
   const labels = {
     friendlyName: 'UPnP name',
     manufacturer: 'Manufacturer',
     model: 'Model',
+    modelNumber: 'Model number',
     deviceType: 'Device type',
     server: 'Server',
   };
@@ -751,6 +831,7 @@ function openSettings() {
   const ports = state.options.ports || [];
   $('#opt-ports').value = ports.length ? ports.join(',') : '';
   $('#opt-deep').checked = !!state.options.deep;
+  $('#opt-http').checked = state.options.http !== false;
   $('#opt-mdns').checked = state.options.mdns !== false;
   $('#opt-ssdp').checked = state.options.ssdp !== false;
   $('#opt-nbns').checked = state.options.nbns !== false;
@@ -778,6 +859,7 @@ async function submitSettings(event) {
   const payload = {
     subnet,
     deep: $('#opt-deep').checked,
+    http: $('#opt-http').checked,
     mdns: $('#opt-mdns').checked,
     ssdp: $('#opt-ssdp').checked,
     nbns: $('#opt-nbns').checked,
@@ -789,6 +871,120 @@ async function submitSettings(event) {
 
   closeSettings();
   await startScan(payload);
+}
+
+/* ------------------------------------------------------------------ */
+/* networks                                                            */
+/* ------------------------------------------------------------------ */
+
+function openNetworks() {
+  const dialog = $('#networks');
+  if (dialog.open) return;
+  renderNetworks();
+  if (typeof dialog.showModal === 'function') dialog.showModal();
+  else dialog.setAttribute('open', '');
+}
+
+function closeNetworks() {
+  const dialog = $('#networks');
+  if (typeof dialog.close === 'function') dialog.close();
+  else dialog.removeAttribute('open');
+}
+
+function renderNetworks() {
+  const list = $('#net-list');
+  if (!list) return;
+  const rows = state.networks.filter((n) => state.showArchived || !n.archived || n.active);
+  $('#net-archived-toggle').hidden = !state.networks.some((n) => n.archived);
+  if (!rows.length) {
+    list.innerHTML = '<li class="dialog-note">No networks saved yet. Run a scan to create one.</li>';
+    return;
+  }
+  const busy = state.scan.running;
+  list.innerHTML = rows.map((net) => {
+    const meta = [
+      net.cidr || 'unknown subnet',
+      plural(net.devices, 'device'),
+      net.online ? `${net.online} online` : 'none online',
+      net.gateway ? `gateway ${net.gateway}` : '',
+      `seen ${ago(net.last_seen)}`,
+    ].filter(Boolean).join(' · ');
+    const id = esc(net.id);
+    const actions = [];
+    if (!net.active) {
+      actions.push(`<button class="btn primary" data-act="select" data-id="${id}" ${busy ? 'disabled' : ''}>Switch</button>`);
+    }
+    actions.push(`<button class="btn ghost" data-act="rename" data-id="${id}">Rename</button>`);
+    if (!net.active) {
+      actions.push(`<button class="btn ghost" data-act="archive" data-id="${id}">${net.archived ? 'Restore' : 'Archive'}</button>`);
+      actions.push(`<button class="btn ghost danger-text" data-act="delete" data-id="${id}">Delete</button>`);
+    }
+    return `<li class="net-item ${net.active ? 'active' : ''} ${net.archived ? 'archived' : ''}" data-id="${id}">
+        <span class="net-title">${esc(net.title)}</span>
+        ${net.active ? '<span class="badge self">active</span>' : net.archived ? '<span class="badge off">archived</span>' : '<span></span>'}
+        <span class="net-meta">${esc(meta)}</span>
+        <span class="net-actions">${actions.join('')}</span>
+      </li>`;
+  }).join('');
+}
+
+async function networkAction(action, id, extra = {}) {
+  try {
+    const result = await api(`/api/network/${action}`, { method: 'POST', body: { id, ...extra } });
+    if (result.networks) state.networks = result.networks;
+    if (action === 'select') {
+      await loadState();
+      closeNetworks();
+      toast('Switched network');
+    } else {
+      renderNetworks();
+      renderNetwork();
+    }
+  } catch (error) {
+    toast(error.message || 'Network action failed', 'error');
+  }
+}
+
+function startRename(item) {
+  const id = item.dataset.id;
+  const net = state.networks.find((n) => n.id === id);
+  if (!net || item.querySelector('.net-rename')) return;
+  const input = document.createElement('input');
+  input.className = 'net-rename';
+  input.maxLength = 60;
+  input.placeholder = 'e.g. Home Wi-Fi';
+  input.value = net.label || '';
+  item.appendChild(input);
+  input.focus();
+  const finish = (save) => {
+    if (!input.isConnected) return;
+    const value = input.value.trim();
+    input.remove();
+    if (save && value !== (net.label || '')) networkAction('rename', id, { label: value });
+  };
+  input.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') { event.preventDefault(); finish(true); }
+    if (event.key === 'Escape') { event.stopPropagation(); finish(false); }
+  });
+  input.addEventListener('blur', () => finish(true));
+}
+
+function onNetworkListClick(event) {
+  const button = event.target.closest('button[data-act]');
+  if (!button) return;
+  const { act, id } = button.dataset;
+  if (act === 'rename') startRename(button.closest('.net-item'));
+  else if (act === 'select') networkAction('select', id);
+  else if (act === 'archive') {
+    const net = state.networks.find((n) => n.id === id);
+    networkAction('archive', id, { archived: !(net && net.archived) });
+  } else if (act === 'delete') {
+    const net = state.networks.find((n) => n.id === id);
+    const name = net ? net.title : 'this network';
+    if (window.confirm(`Delete ${name} and its ${net ? plural(net.devices, 'saved device') : 'devices'}? This cannot be undone.`)) {
+      networkAction('delete', id);
+    }
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -885,7 +1081,18 @@ function bindEvents() {
   });
 
   $('#settings-btn').addEventListener('click', openSettings);
-  $('#net-chip').addEventListener('click', openSettings);
+  $('#net-chip').addEventListener('click', openNetworks);
+  $('#networks-close').addEventListener('click', closeNetworks);
+  $('#networks-done').addEventListener('click', closeNetworks);
+  $('#networks-settings').addEventListener('click', () => {
+    closeNetworks();
+    openSettings();
+  });
+  $('#net-list').addEventListener('click', onNetworkListClick);
+  $('#net-show-archived').addEventListener('change', (event) => {
+    state.showArchived = event.target.checked;
+    renderNetworks();
+  });
   $('#settings-close').addEventListener('click', closeSettings);
   $('#settings-cancel').addEventListener('click', closeSettings);
   $('#settings-form').addEventListener('submit', submitSettings);

@@ -17,7 +17,7 @@ from . import __version__, collectors, netif, oui
 from .model import Device, normalize_ip
 from .store import Store
 
-COLLECTOR_ORDER = ("icmp", "arp", "tcp", "mdns", "ssdp", "nbns", "rdns")
+COLLECTOR_ORDER = ("icmp", "arp", "tcp", "http", "mdns", "ssdp", "nbns", "rdns")
 
 DEEP_PORTS = [53, 80, 443, 445, 631, 8080, 9100]
 
@@ -60,6 +60,7 @@ class ScanOptions:
     concurrency: int = 64
     max_hosts: int = netif.DEFAULT_MAX_HOSTS
     deep: bool = False
+    http: bool = True
     mdns: bool = True
     ssdp: bool = True
     nbns: bool = True
@@ -73,6 +74,7 @@ class ScanOptions:
             "concurrency": self.concurrency,
             "max_hosts": self.max_hosts,
             "deep": self.deep,
+            "http": self.http,
             "mdns": self.mdns,
             "ssdp": self.ssdp,
             "nbns": self.nbns,
@@ -102,7 +104,7 @@ class ScanOptions:
             options.concurrency = _clamp_int(payload.get("concurrency"), 1, 256, "concurrency")
         if "max_hosts" in payload:
             options.max_hosts = _clamp_int(payload.get("max_hosts"), 1, 65536, "max_hosts")
-        for name in ("deep", "mdns", "ssdp", "nbns", "rdns"):
+        for name in ("deep", "http", "mdns", "ssdp", "nbns", "rdns"):
             if name in payload:
                 value = payload.get(name)
                 if not isinstance(value, bool):
@@ -185,8 +187,9 @@ class ScanEngine:
         self.refresh_interfaces()
         # "Online" means "answered during this process", not "was online when
         # the inventory was written", so a restart starts from a clean slate.
-        for device in self.store.devices.values():
+        for device in self.store.all_devices():
             device.online = False
+        self._activate_detected_network()
         self.state: dict[str, Any] = {
             "running": False,
             "phase": "idle",
@@ -219,6 +222,82 @@ class ScanEngine:
         with self._lock:
             self._interfaces = usable
         return [iface.to_dict() for iface in usable]
+
+    def _activate_detected_network(self) -> None:
+        """Show the inventory of the network we are on right now, if we know it.
+
+        Unknown networks are not created here; that happens on the first scan,
+        so merely opening the dashboard never litters the store.
+        """
+        try:
+            iface = netif.choose_interface(self._interfaces)
+        except netif.InterfaceError:
+            return
+        record = self.store.find(iface.cidr, self._gateway_mac_for(iface.network))
+        if record is not None:
+            self.store.select(record.id)
+
+    @staticmethod
+    def _gateway_mac_for(network: ipaddress.IPv4Network) -> str | None:
+        """MAC of the default gateway on *network*, used to tell twin subnets apart."""
+        gateway = netif.default_gateway(network)
+        if not gateway:
+            return None
+        try:
+            table, _ = collectors.arp_table()
+        except Exception:  # pragma: no cover - defensive
+            return None
+        return table.get(gateway)
+
+    def networks(self) -> list[dict[str, Any]]:
+        return self.store.networks_summary()
+
+    def _network_changed(self) -> None:
+        self._emit(
+            "network.changed",
+            networks=self.store.networks_summary(),
+            active=self.store.active_id,
+        )
+
+    def select_network(self, network_id: str) -> tuple[bool, str]:
+        if self.running:
+            return False, "stop the running scan before switching networks"
+        record = self.store.select(network_id)
+        if record is None:
+            return False, f"unknown network {network_id!r}"
+        self.store.save()
+        self._network_changed()
+        return True, ""
+
+    def archive_network(self, network_id: str, archived: bool) -> tuple[bool, str]:
+        try:
+            record = self.store.archive(network_id, archived)
+        except ValueError as exc:
+            return False, str(exc)
+        if record is None:
+            return False, f"unknown network {network_id!r}"
+        self.store.save()
+        self._network_changed()
+        return True, ""
+
+    def rename_network(self, network_id: str, label: str | None) -> tuple[bool, str]:
+        record = self.store.rename_network(network_id, label)
+        if record is None:
+            return False, f"unknown network {network_id!r}"
+        self.store.save()
+        self._network_changed()
+        return True, ""
+
+    def delete_network(self, network_id: str) -> tuple[bool, str]:
+        try:
+            removed = self.store.delete_network(network_id)
+        except ValueError as exc:
+            return False, str(exc)
+        if not removed:
+            return False, f"unknown network {network_id!r}"
+        self.store.save()
+        self._network_changed()
+        return True, ""
 
     @property
     def running(self) -> bool:
@@ -301,6 +380,7 @@ class ScanEngine:
         """Re-check one device without disturbing the rest of the inventory."""
         address = normalize_ip(ip)
         rtt = collectors.ping_host(address, self.options.ping_timeout)
+        ttl = collectors.ttl_for(address) if rtt is not None else None
         open_ports = collectors.scan_ports(
             [address], self.options.ports, timeout=0.25, workers=32
         ).get(address, [])
@@ -311,7 +391,7 @@ class ScanEngine:
         if open_ports:
             sources.append("tcp")
         device = self.store.upsert(
-            Device(ip=address, rtt_ms=rtt, ports=open_ports, sources=sources, online=online)
+            Device(ip=address, rtt_ms=rtt, ttl=ttl, ports=open_ports, sources=sources, online=online)
         )
         with self.store.lock:
             device.online = online
@@ -370,7 +450,9 @@ class ScanEngine:
                 self.refresh_interfaces()
             interface_ip = iface.address if iface else None
             cidr = str(network)
-            gateway = str(network.network_address + 1)
+            gateway = netif.default_gateway(network) or str(network.network_address + 1)
+            gateway_mac = self._gateway_mac_for(network)
+            record = self.store.activate(cidr, gateway_mac)
             network_info: dict[str, Any] = {
                 "cidr": cidr,
                 "interface": iface.name if iface else None,
@@ -378,6 +460,8 @@ class ScanEngine:
                 "netmask": iface.netmask if iface else str(network.netmask),
                 "broadcast": str(network.broadcast_address),
                 "gateway": gateway,
+                "gateway_mac": gateway_mac,
+                "network_id": record.id,
                 "host_count": netif.host_capacity(network),
                 "scanned_at": time.time(),
                 "source": options.subnet or "auto",
@@ -392,6 +476,7 @@ class ScanEngine:
                 network=network_info,
             )
             self._emit("network", network=network_info)
+            self._network_changed()
 
             # Passive collectors run while the sweep does the heavy lifting.
             if options.mdns and interface_ip:
@@ -429,6 +514,7 @@ class ScanEngine:
                         ip=ip,
                         rtt_ms=rtt,
                         online=True,
+                        ttl=collectors.ttl_for(ip),
                         sources=["icmp"],
                         is_self=(ip == interface_ip),
                     )
@@ -512,6 +598,26 @@ class ScanEngine:
                 )
                 self._phase("probe", "service probe complete", len(alive), len(alive))
 
+                # 4b. Ask web ports what they are: title, Server header, TLS name.
+                if options.http and not self._cancel.is_set():
+                    self._phase("probe", "reading web banners", 0, len(open_map))
+                    web = collectors.http_probe_many(open_map)
+                    for ip, pages in sorted(web.items()):
+                        self._record(
+                            Device(ip=ip, web=pages, sources=["http"], online=True), seen
+                        )
+                    pages_found = sum(len(pages) for pages in web.values())
+                    self._collector(
+                        "http",
+                        "ok" if web else "empty",
+                        f"{pages_found} web pages on {len(web)} hosts"
+                        if web
+                        else "no web interfaces answered",
+                        pages_found,
+                    )
+                elif not options.http:
+                    self._collector("http", "skipped", "web fingerprinting is off")
+
             # 5. Names: NetBIOS first (ranks above reverse DNS), then PTR.
             if options.nbns and alive:
                 self._phase("names", "asking NetBIOS for names")
@@ -563,8 +669,16 @@ class ScanEngine:
             self._merge_ssdp(passive.get("ssdp"), network, seen)
 
             # 7. Gateway and self marks.
-            gateway_ip = netif.guess_gateway(network, alive)
+            gateway_ip = netif.default_gateway(network) or netif.guess_gateway(network, alive)
             network_info["gateway"] = gateway_ip
+            gateway_device = self.store.devices.get(gateway_ip)
+            if gateway_device is not None and gateway_device.mac:
+                network_info["gateway_mac"] = gateway_device.mac
+            with self.store.lock:
+                for stale in self.store.devices.values():
+                    if stale.is_gateway and stale.ip != gateway_ip:
+                        stale.is_gateway = False
+                        self._emit("device", device=stale.to_dict())
             network_info["hosts_up"] = len(alive)
             self.store.set_network(network_info)
             self._emit("network", network=network_info)
@@ -734,6 +848,7 @@ class ScanEngine:
                     ("friendly", "friendlyName"),
                     ("manufacturer", "manufacturer"),
                     ("model", "model"),
+                    ("model_number", "modelNumber"),
                     ("device_type", "deviceType"),
                     ("server", "server"),
                 ):

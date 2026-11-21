@@ -75,6 +75,7 @@ def patched_scan(extra: dict | None = None):
     """Patch every collector so a scan runs offline and deterministically."""
     patches = {
         "lanwatch.discovery.netif.resolve_target": mock.Mock(side_effect=lambda *a, **k: fake_target()),
+        "lanwatch.discovery.netif.default_gateway": mock.Mock(return_value=None),
         "lanwatch.discovery.collectors.ping_available": mock.Mock(return_value=True),
         "lanwatch.discovery.collectors.ping_sweep": mock.Mock(side_effect=_fake_ping_sweep),
         "lanwatch.discovery.collectors.arp_table": mock.Mock(
@@ -85,6 +86,11 @@ def patched_scan(extra: dict | None = None):
         ),
         "lanwatch.discovery.collectors.scan_ports": mock.Mock(side_effect=_fake_scan_ports),
         "lanwatch.discovery.collectors.grab_banner": mock.Mock(return_value=None),
+        "lanwatch.discovery.collectors.http_probe_many": mock.Mock(
+            return_value={
+                "10.0.0.1": {"80": {"status": "200", "title": "Acme Router Login", "server": "uhttpd"}}
+            }
+        ),
         "lanwatch.discovery.collectors.run_bounded": mock.Mock(return_value={"10.0.0.1": "ROUTER"}),
         "lanwatch.discovery.collectors.reverse_dns_many": mock.Mock(
             return_value={"10.0.0.1": "router.lan"}

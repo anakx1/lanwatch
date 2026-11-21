@@ -127,6 +127,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._serve_events()
             elif path == "/api/health":
                 self._send_json({"ok": True, "version": __version__, "time": time.time()})
+            elif path == "/api/networks":
+                self._send_json(
+                    {
+                        "ok": True,
+                        "networks": self.engine.networks(),
+                        "active": self.engine.store.active_id,
+                    }
+                )
             elif path == "/api/network":
                 self._send_json(
                     {
@@ -169,6 +177,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._probe(payload)
             elif path == "/api/forget":
                 self._forget(payload)
+            elif path == "/api/network/select":
+                self._network_action(payload, "select")
+            elif path == "/api/network/archive":
+                self._network_action(payload, "archive")
+            elif path == "/api/network/rename":
+                self._network_action(payload, "rename")
+            elif path == "/api/network/delete":
+                self._network_action(payload, "delete")
             elif path == "/api/interfaces":
                 self._send_json({"ok": True, "interfaces": self.engine.refresh_interfaces()})
             else:
@@ -268,6 +284,31 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_error_json(409, message)
             return
         self._send_json({"ok": True, "state": self.engine.state_dict()}, 202)
+
+    def _network_action(self, payload: dict[str, Any], action: str) -> None:
+        network_id = payload.get("id")
+        if not isinstance(network_id, str) or not network_id:
+            raise ValueError("id is required")
+        engine = self.engine
+        if action == "select":
+            ok, message = engine.select_network(network_id)
+        elif action == "archive":
+            archived = payload.get("archived", True)
+            if not isinstance(archived, bool):
+                raise ValueError("archived must be a boolean")
+            ok, message = engine.archive_network(network_id, archived)
+        elif action == "rename":
+            label = payload.get("label")
+            if label is not None and not isinstance(label, str):
+                raise ValueError("label must be a string")
+            ok, message = engine.rename_network(network_id, label)
+        else:
+            ok, message = engine.delete_network(network_id)
+        if not ok:
+            status = 404 if message.startswith("unknown") else 409
+            self._send_error_json(status, message)
+            return
+        self._send_json({"ok": True, **{"networks": engine.networks()}})
 
     def _update_device(self, payload: dict[str, Any]) -> None:
         ip = payload.get("ip")

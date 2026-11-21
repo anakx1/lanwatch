@@ -9,6 +9,8 @@ commonly unavailable to ordinary apps.
 from __future__ import annotations
 
 import contextlib
+import html
+import http.client
 import ipaddress
 import math
 import os
@@ -17,6 +19,7 @@ import re
 import select
 import shutil
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -60,10 +63,22 @@ DEFAULT_PORTS = [
 
 BANNER_PORTS = {21, 22, 23, 25, 110, 143, 993, 995}
 
-MAX_SSDP_DESCRIPTIONS = 12
+MAX_SSDP_DESCRIPTIONS = 24
+
+# Ports that may speak HTTP(S); probed for a page title, Server header and cert.
+WEB_PORTS = {80: False, 443: True, 3000: False, 5000: False, 8000: False, 8008: False,
+             8080: False, 8443: True, 8888: False, 9000: False}
+WEB_READ_BYTES = 16384
 
 _ping_checked: bool | None = None
 _ping_lock = threading.Lock()
+# ip -> TTL from the last ping reply; the ICMP sweep records it for free.
+_ttl_seen: dict[str, int] = {}
+
+
+def ttl_for(ip: str) -> int | None:
+    """TTL seen in the last ping reply from *ip*, if any (OS fingerprinting hint)."""
+    return _ttl_seen.get(ip)
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +130,11 @@ def ping_host(ip: str, timeout: float = 1.0) -> float | None:
         return None
     if result.returncode != 0:
         return None
-    match = re.search(r"time[=<]\s*([\d.]+)\s*ms", result.stdout.decode("utf-8", "replace"))
+    output = result.stdout.decode("utf-8", "replace")
+    ttl_match = re.search(r"ttl[=:]\s*(\d+)", output, flags=re.IGNORECASE)
+    if ttl_match:
+        _ttl_seen[ip] = int(ttl_match.group(1))
+    match = re.search(r"time[=<]\s*([\d.]+)\s*ms", output)
     if match:
         return float(match.group(1))
     return round((time.monotonic() - started) * 1000, 2)
@@ -488,6 +507,7 @@ def _enrich_ssdp(devices: list[dict[str, str]]) -> None:
         entry["manufacturer"] = values.get("manufacturer", "")
         entry["model"] = values.get("modelName", "")
         entry["device_type"] = values.get("deviceType", "")
+        entry["model_number"] = values.get("modelNumber", "")
 
 
 def _fetch_description(location: str, timeout: float = 2.0) -> dict[str, str]:
@@ -505,6 +525,146 @@ def _fetch_description(location: str, timeout: float = 2.0) -> dict[str, str]:
         if tag in wanted and element.text and not values.get(tag):
             values[tag] = element.text.strip()[:120]
     return values
+
+
+# ---------------------------------------------------------------------------
+# HTTP(S) fingerprint
+# ---------------------------------------------------------------------------
+
+_TITLE_RE = re.compile(rb"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+_REALM_RE = re.compile(r'realm="?([^",]+)', re.IGNORECASE)
+_OID_CN = b"\x55\x04\x03"
+_OID_ORG = b"\x55\x04\x0a"
+
+
+def _clip(text: str, limit: int = 80) -> str:
+    return re.sub(r"\s+", " ", text).strip()[:limit]
+
+
+def _der_string_after(der: bytes, oid: bytes) -> str | None:
+    """Return the last string value that follows *oid* in a DER blob.
+
+    A certificate lists its issuer before its subject, so the last occurrence
+    of the common-name OID is the subject (the two are equal when self-signed).
+    This is a deliberately tiny reader, not a full X.509 parser.
+    """
+    index = der.rfind(oid)
+    if index < 0:
+        return None
+    pos = index + len(oid)
+    if pos + 2 > len(der):
+        return None
+    tag, length = der[pos], der[pos + 1]
+    if tag not in (0x0C, 0x13, 0x16, 0x14) or length >= 0x80:
+        return None
+    raw = der[pos + 2 : pos + 2 + length]
+    if len(raw) != length:
+        return None
+    return _clip(raw.decode("utf-8", "replace"), 64) or None
+
+
+def cert_names(der: bytes) -> dict[str, str]:
+    """Extract the subject common name and organisation from a DER certificate."""
+    names: dict[str, str] = {}
+    common = _der_string_after(der, _OID_CN)
+    if common:
+        names["cert_cn"] = common
+    org = _der_string_after(der, _OID_ORG)
+    if org:
+        names["cert_org"] = org
+    return names
+
+
+def parse_http_response(headers: dict[str, str], body: bytes, status: int) -> dict[str, str]:
+    """Reduce an HTTP response to the few fields worth keeping."""
+    info: dict[str, str] = {"status": str(status)}
+    server = headers.get("server")
+    if server:
+        info["server"] = _clip(server)
+    powered = headers.get("x-powered-by")
+    if powered:
+        info["powered_by"] = _clip(powered)
+    realm = _REALM_RE.search(headers.get("www-authenticate", ""))
+    if realm:
+        info["realm"] = _clip(realm.group(1))
+    match = _TITLE_RE.search(body)
+    if match:
+        title = html.unescape(match.group(1).decode("utf-8", "replace"))
+        title = _clip(title)
+        if title:
+            info["title"] = title
+    return info
+
+
+def http_probe(ip: str, port: int, timeout: float = 1.5) -> dict[str, str]:
+    """Fetch ``/`` from one web port and describe what answered.
+
+    Self-signed certificates are expected on LAN gear, so verification is off:
+    this reads identity hints only and never sends credentials.  Returns an
+    empty dict when nothing usable answered.
+    """
+    use_tls = WEB_PORTS.get(port, False)
+    info: dict[str, str] = {}
+    connection: http.client.HTTPConnection
+    if use_tls:
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        connection = http.client.HTTPSConnection(ip, port, timeout=timeout, context=context)
+    else:
+        connection = http.client.HTTPConnection(ip, port, timeout=timeout)
+    try:
+        connection.request(
+            "GET", "/", headers={"User-Agent": "lanwatch/0.1", "Accept": "text/html,*/*;q=0.5"}
+        )
+        if use_tls and connection.sock is not None:
+            sock = connection.sock
+            getter = getattr(sock, "getpeercert", None)
+            der = getter(binary_form=True) if getter else None
+            if der:
+                info.update(cert_names(der))
+        response = connection.getresponse()
+        body = response.read(WEB_READ_BYTES)
+        headers = {key.lower(): value for key, value in response.getheaders()}
+        info.update(parse_http_response(headers, body, response.status))
+    except (OSError, http.client.HTTPException, ssl.SSLError, ValueError):
+        return info if len(info) > 0 and use_tls else {}
+    finally:
+        connection.close()
+    return info
+
+
+def http_probe_many(
+    open_map: dict[str, list[int]],
+    timeout: float = 1.5,
+    workers: int = 16,
+    deadline: float = 10.0,
+) -> dict[str, dict[str, dict[str, str]]]:
+    """Probe every open web port; returns ``ip -> port -> info``."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import TimeoutError as FutureTimeoutError
+
+    tasks = [(ip, port) for ip, ports in open_map.items() for port in ports if port in WEB_PORTS]
+    if not tasks:
+        return {}
+    results: dict[str, dict[str, dict[str, str]]] = {}
+    pool = ThreadPoolExecutor(max_workers=max(1, min(workers, len(tasks))))
+    try:
+        futures = {pool.submit(http_probe, ip, port, timeout): (ip, port) for ip, port in tasks}
+        try:
+            for future in as_completed(futures, timeout=deadline):
+                ip, port = futures[future]
+                try:
+                    info = future.result()
+                except Exception:
+                    info = {}
+                if info:
+                    results.setdefault(ip, {})[str(port)] = info
+        except FutureTimeoutError:
+            pass
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    return results
 
 
 # ---------------------------------------------------------------------------

@@ -54,9 +54,10 @@ working one.
 
 | Collector | What it does | Notes |
 | --- | --- | --- |
-| ICMP sweep | Parallel `ping` across the subnet, records RTT | Main liveness signal; uses the system `ping` |
+| ICMP sweep | Parallel `ping` across the subnet, records RTT and reply TTL (an OS hint) | Main liveness signal; uses the system `ping` |
 | ARP / neighbour | Reads MAC addresses from `/proc/net/arp`, `ip neigh`, or `arp -an` | Usually blocked on Android; often empty there |
 | TCP probe | Connects to `DEFAULT_PORTS` (22, 53, 80, 443, 8009, 9100, 32400, …) | `--deep` also probes hosts that ignore ICMP |
+| Web fingerprint | `GET /` on open web ports: page title, `Server` header, login realm, TLS certificate name | Unverified TLS (LAN gear is self-signed); reads identity hints only. `--no-http` disables it |
 | Banner grab | Reads a short greeting from FTP/SSH/Telnet/SMTP/IMAP/POP3 ports | Best effort, only when the port is open |
 | mDNS-SD | Browses `_services._dns-sd._udp.local` and resolves hostnames | Needs multicast; often filtered on Android |
 | SSDP / UPnP | Sends `M-SEARCH`, fetches device descriptions for friendly names | Needs multicast |
@@ -71,6 +72,42 @@ Hostname priority when several sources answer:
 device is marked offline at startup, so the dashboard never shows yesterday's
 results as live.
 
+## Fingerprinting: "what is this device?"
+
+Android hides MAC addresses from ordinary apps, so many devices arrive with no
+vendor. `lanwatch/fingerprint.py` identifies them from every other signal:
+hostnames, mDNS service types, UPnP descriptions, web titles and `Server`
+headers, TLS certificate names, open ports and the ICMP TTL.
+
+Each signal casts a weighted vote for a kind (router, printer, TV, NAS, camera,
+phone, speaker, console, smart device, computer, media). The winner becomes the
+device kind; its margin over the runner-up becomes a confidence score, and every
+vote keeps a human-readable reason ("web page looks like a printer", "JetDirect
+port 9100 open") shown in the device drawer under **Why we think so**. Weak or
+conflicting evidence stays "Unknown device" instead of guessing. Names fall back
+to the fingerprint (`TP-Link Archer AX50`, a clean page title, or
+`Brother printer`) only after your label, the hostname and the UPnP name.
+
+TTL hints (64 → Linux/Android/Apple, 128 → Windows, 255 → network gear) are
+deliberately weak. The module is pure: it never touches the network.
+
+## Networks
+
+Each network gets its own inventory, so the same `192.168.1.0/24` at home and at
+the office never mix and a stale router from another Wi-Fi is not shown next to
+today's. A network is identified by its CIDR plus, when readable, the gateway's
+MAC (same CIDR with a different gateway MAC is a different network).
+
+- On startup the dashboard shows the inventory of the network you are on, if known.
+- Scanning a new network creates it; nothing is created merely by opening the UI.
+- Tap the network chip to switch, rename, archive/restore or delete networks.
+  Switching is refused while a scan runs; the active network cannot be deleted.
+- The default gateway is read from `/proc/net/route` or `ip route` when possible
+  (not on most Android builds, where the previous guess is used), and only one
+  device per network carries the gateway badge.
+- Old flat `devices.json` files (schema 1) are migrated automatically on first
+  load: devices are grouped by their /24.
+
 ## The dashboard
 
 `lanwatch web` serves a single-page dashboard (HTML/CSS/JS, no build step):
@@ -78,6 +115,8 @@ results as live.
 - Live device table over Server-Sent Events (`/api/events`) — no polling.
 - Collector status chips: see at a glance what worked on this network.
 - Filters (all / online / named / known vendor), sorting, and search.
+- Network switcher with per-network inventories (see [Networks](#networks)).
+- Device kind icons, confidence, and the evidence behind each guess.
 - Device drawer: rename, add notes, run an on-demand port probe, forget.
 - Scan settings dialog: subnet, ports, timeout, concurrency, deep mode,
   per-collector toggles — applied to the next scan.
@@ -124,6 +163,7 @@ All responses are JSON unless noted. `GET` endpoints are read-only.
 | GET | `/api/events` | SSE stream of snapshots (`text/event-stream`) |
 | GET | `/api/health` | `{ok, version, time}` |
 | GET | `/api/network` | Detected interfaces and current network |
+| GET | `/api/networks` | Saved networks and the active one |
 | GET | `/api/export.csv` | Inventory as CSV |
 | GET | `/api/export.json` | Inventory as JSON |
 | POST | `/api/scan` | Start a scan; body may contain scan options |
@@ -132,6 +172,10 @@ All responses are JSON unless noted. `GET` endpoints are read-only.
 | POST | `/api/probe` | Probe `{ip, ports?}` on demand |
 | POST | `/api/forget` | Remove `{ip}` |
 | POST | `/api/interfaces` | Re-detect interfaces |
+| POST | `/api/network/select` | Switch the active network `{id}` (409 while scanning) |
+| POST | `/api/network/rename` | `{id, label}` (blank clears) |
+| POST | `/api/network/archive` | `{id, archived?}` (not the active network) |
+| POST | `/api/network/delete` | `{id}` (not the active network) |
 
 Scan options accepted by `/api/scan`:
 
@@ -143,6 +187,7 @@ Scan options accepted by `/api/scan`:
   "concurrency": 64,
   "max_hosts": 1024,
   "deep": false,
+  "http": true,
   "mdns": true,
   "ssdp": true,
   "nbns": true,
