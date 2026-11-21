@@ -12,6 +12,7 @@ import json
 import mimetypes
 import queue
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -21,7 +22,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from . import __version__
 from .discovery import ScanEngine, ScanOptions
@@ -32,6 +33,8 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 MAX_BODY = 64 * 1024
 CLIENT_HEADER = "X-Lanwatch"
 SSE_HEARTBEAT = 12.0
+HISTORY_DEFAULT = 12
+HISTORY_MAX = 200
 
 _MIME = {
     ".html": "text/html; charset=utf-8",
@@ -52,6 +55,18 @@ _CSP = (
     "form-action 'none'; "
     "frame-ancestors 'none'"
 )
+
+
+def _history_limit(raw: str) -> int:
+    if not raw:
+        return HISTORY_DEFAULT
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("limit must be an integer") from exc
+    if not 1 <= value <= HISTORY_MAX:
+        raise ValueError(f"limit must be between 1 and {HISTORY_MAX}")
+    return value
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -135,6 +150,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         "interfaces": [iface.to_dict() for iface in self.engine.interfaces],
                     }
                 )
+            elif path == "/api/history":
+                self._serve_history(parsed.query)
             elif path in ("/api/export.csv", "/api/export.json"):
                 self._serve_export(path)
             elif path.startswith("/api/"):
@@ -256,6 +273,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "application/json; charset=utf-8",
                 {"Content-Disposition": f'attachment; filename="lanwatch-{stamp}.json"'},
             )
+
+    def _serve_history(self, query: str) -> None:
+        raw_limit = parse_qs(query).get("limit", [""])[0]
+        try:
+            limit = _history_limit(raw_limit)
+        except ValueError as exc:
+            self._send_error_json(400, str(exc))
+            return
+        try:
+            scans = self.engine.history.recent(limit)
+        except (OSError, sqlite3.Error) as exc:
+            self._send_error_json(500, f"history unavailable: {exc}")
+            return
+        self._send_json(
+            {
+                "ok": True,
+                "scans": scans,
+                "path": str(self.engine.history.path),
+                "error": self.engine.history_error,
+            }
+        )
 
     def _start_scan(self, payload: dict[str, Any]) -> None:
         try:

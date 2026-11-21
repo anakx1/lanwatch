@@ -224,6 +224,58 @@ class EngineTests(unittest.TestCase):
         self.assertIn("collector", kinds)
         self.assertIn("scan.finished", kinds)
 
+    def test_scan_is_recorded_in_history(self) -> None:
+        self.run_scan()
+        scans = self.engine.history.recent(5)
+        self.assertEqual(len(scans), 1)
+        scan = scans[0]
+        self.assertEqual(scan["subnet"], "10.0.0.0/24")
+        self.assertEqual(scan["devices_found"], 4)
+        self.assertEqual(scan["hosts_up"], 2)
+        self.assertFalse(scan["stopped"])
+        self.assertIsNone(scan["error"])
+
+        visits = self.engine.history.device_history("10.0.0.1")
+        self.assertEqual(len(visits), 1)
+        self.assertEqual(visits[0]["name"], "ROUTER")
+        self.assertEqual(visits[0]["ports"], [80, 443])
+        self.assertEqual(visits[0]["latency_ms"], 3.0)
+
+    def test_stopped_scan_is_recorded(self) -> None:
+        def stop_sweep(
+            hosts: list[str],
+            timeout: float,
+            concurrency: int,
+            on_up: object,
+            cancel: object,
+            on_result: object,
+        ) -> dict[str, float]:
+            assert hasattr(cancel, "set")
+            cancel.set()  # type: ignore[attr-defined]
+            return {}
+
+        extra = {
+            "lanwatch.discovery.collectors.ping_sweep": unittest.mock.Mock(
+                side_effect=stop_sweep
+            )
+        }
+        with patched_scan(extra):
+            started, message = self.engine.start()
+            self.assertTrue(started, message)
+            self.assertTrue(wait_until(lambda: not self.engine.running))
+
+        scans = self.engine.history.recent(5)
+        self.assertEqual(len(scans), 1)
+        self.assertTrue(scans[0]["stopped"])
+
+    def test_history_write_failure_does_not_break_scan(self) -> None:
+        self.engine.history = unittest.mock.Mock()
+        self.engine.history.record_scan.side_effect = OSError("disk full")
+        self.run_scan()
+        self.assertEqual(self.engine.state_dict()["phase"], "done")
+        self.assertIn("disk full", self.engine.history_error or "")
+        self.assertTrue(self.store.devices["10.0.0.1"].online)
+
     def test_probe_device_toggles_online(self) -> None:
         self.store.upsert(Device(ip="10.0.0.1", online=True))
         with unittest.mock.patch(

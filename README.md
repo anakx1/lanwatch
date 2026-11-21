@@ -81,6 +81,7 @@ results as live.
 - Device drawer: rename, add notes, run an on-demand port probe, forget.
 - Scan settings dialog: subnet, ports, timeout, concurrency, deep mode,
   per-collector toggles — applied to the next scan.
+- Scan history: a live trend bar chart and recent-scan table backed by SQLite.
 - Auto-scan interval, CSV/JSON export, dark/light-friendly responsive layout.
 
 The server binds to `127.0.0.1` by default. Use `--host 0.0.0.0` only on a
@@ -94,6 +95,7 @@ lanwatch [--state PATH] <command> ...
   scan [subnet]     discover devices once
   watch             scan repeatedly (-i SECONDS, default 30)
   devices           list the saved inventory
+  history           show recent scans (--limit, --device IP, --json)
   web               serve the web dashboard
   label IP [NAME]   give a device a friendly name (--notes)
   forget IP         remove a device
@@ -107,12 +109,16 @@ lanwatch scan --json > snapshot.json     # full snapshot
 lanwatch scan --csv                      # inventory as CSV
 lanwatch scan --all                      # include offline devices
 lanwatch devices --online --verbose
+lanwatch history --limit 10              # recent scans
+lanwatch history --device 192.168.1.24   # one device's presence history
 lanwatch web --port 8799 --no-open --scan
 ```
 
 `--state PATH` (or `LANWATCH_STATE`) overrides the inventory file. The default
 is `$XDG_STATE_HOME/lanwatch/devices.json`, i.e.
-`~/.local/state/lanwatch/devices.json`.
+`~/.local/state/lanwatch/devices.json`. Scan history is stored next to it as
+`<inventory>-history.db` (default `devices-history.db`); `LANWATCH_HISTORY`
+overrides that path.
 
 ## HTTP API
 
@@ -124,6 +130,7 @@ All responses are JSON unless noted. `GET` endpoints are read-only.
 | GET | `/api/events` | SSE stream of snapshots (`text/event-stream`) |
 | GET | `/api/health` | `{ok, version, time}` |
 | GET | `/api/network` | Detected interfaces and current network |
+| GET | `/api/history?limit=N` | Recent scans (1–200, default 12) |
 | GET | `/api/export.csv` | Inventory as CSV |
 | GET | `/api/export.json` | Inventory as JSON |
 | POST | `/api/scan` | Start a scan; body may contain scan options |
@@ -152,6 +159,29 @@ Scan options accepted by `/api/scan`:
 
 `ports` may also be a comma-separated string. Invalid or missing fields fall
 back to the server defaults; out-of-range values are clamped.
+
+Every `/api/scan` response is followed by an SSE `scan.finished` event once the
+snapshot is saved and the history row is written. A 202 response means the
+scan started, not that it finished.
+
+## Scan history
+
+Each completed or stopped scan is appended to a local SQLite database
+(`<inventory>-history.db` next to the inventory). The dashboard shows the last
+12 scans as a bar chart plus a table; the CLI exposes the same data:
+
+```bash
+lanwatch history
+lanwatch history --device 192.168.1.24 --limit 50
+lanwatch history --json
+```
+
+The `scans` table stores the network, start/finish times, duration, host and
+device counts, and a stopped/error flag. `scan_devices` stores the snapshot of
+each device seen in that scan, so per-device presence and services are
+available even after the device disappears from the inventory. History is
+capped at the newest 500 scans to keep the database small; SQLite is part of
+the Python standard library, so this adds no dependency.
 
 ## Running on Android / Termux
 
@@ -182,7 +212,7 @@ On a normal Linux machine all collectors usually work, with or without root.
 ## Tests and development
 
 ```bash
-python3 -m unittest discover -s tests -t .   # 61 tests
+python3 -m unittest discover -s tests -t .   # 80 tests
 ruff check .
 mypy
 ```
@@ -196,6 +226,7 @@ bin/lanwatch          launcher for a checkout
 lanwatch/
   cli.py              argparse commands and table rendering
   discovery.py        scan engine, options, event bus
+  history.py          SQLite scan history and trends
   collectors.py       ICMP, ARP, TCP, mDNS, SSDP, NBNS, rDNS primitives
   dnsparse.py         minimal DNS packet codec (no dnspython)
   netif.py            interface detection and subnet resolution
