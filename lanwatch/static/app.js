@@ -79,9 +79,22 @@ const state = {
   autoTimer: null,
   renderQueued: false,
   search: '',
+  latestDiff: null,
   history: { scans: [], path: '', error: null },
-  prefs: { showOffline: true, sort: 'ip', autoScan: false, autoInterval: 60 },
+  events: {
+    items: [],
+    unread: 0,
+    path: '',
+    error: null,
+    severity: 'all',
+    unreadOnly: false,
+    hasMore: false,
+  },
+  prefs: { showOffline: true, sort: 'ip', autoScan: false, autoInterval: 60, trustFilter: 'all' },
 };
+
+const TRUST_LABELS = { trusted: 'Trusted', unknown: 'Unknown', ignored: 'Ignored' };
+const SEVERITY_LABELS = { info: 'Info', notice: 'Notice', warning: 'Warning', critical: 'Critical' };
 
 /* ------------------------------------------------------------------ */
 /* helpers                                                             */
@@ -197,6 +210,12 @@ function applySnapshot(data) {
     state.history.path = data.history.path || '';
     state.history.error = data.history.error || null;
   }
+  if (data.events) {
+    state.events.path = data.events.path || state.events.path;
+    state.events.error = data.events.error || null;
+    state.events.unread = Number(data.events.unread) || 0;
+  }
+  state.latestDiff = data.latest_diff || null;
   renderAll();
 }
 
@@ -204,12 +223,15 @@ function handleEvent(event) {
   switch (event.type) {
     case 'hello':
       if (event.state) state.scan = event.state;
+      if (event.unread != null) state.events.unread = Number(event.unread) || 0;
+      if (event.latest_diff) state.latestDiff = event.latest_diff;
       setSync(true);
       break;
     case 'scan.started':
       if (event.state) state.scan = event.state;
       if (event.network) state.network = event.network;
       if (event.options) state.options = event.options;
+      state.latestDiff = null;
       state.collectors = {};
       COLLECTORS.forEach(([name]) => {
         state.collectors[name] = { status: 'pending', detail: 'waiting', count: 0 };
@@ -230,7 +252,10 @@ function handleEvent(event) {
       renderNetworks();
       // The active inventory changed (scan on another network, or a switch from
       // another browser tab): reload so the device list matches.
-      if ((state.activeNetwork && state.activeNetwork.id) !== event.active) loadState();
+      if ((state.activeNetwork && state.activeNetwork.id) !== event.active) {
+        loadState();
+        loadEvents(true, true);
+      }
       break;
     case 'device':
       upsertDevice(event.device);
@@ -239,6 +264,14 @@ function handleEvent(event) {
     case 'device.removed':
       state.devices.delete(event.ip);
       if (state.drawerIp === event.ip) closeDrawer();
+      break;
+    case 'scan.diff':
+      state.latestDiff = event.diff || event;
+      announceDiff(state.latestDiff);
+      if ($('#event-center') && $('#event-center').open) loadEvents(true);
+      break;
+    case 'event.new':
+      acceptEvent(event.event || event);
       break;
     case 'scan.finished':
       if (event.state) state.scan = event.state;
@@ -251,6 +284,7 @@ function handleEvent(event) {
         toast(`Scan complete · ${plural(online, 'device')} online`);
       }
       loadHistory();
+      loadEvents(true, true);
       break;
     case 'scan.error':
       toast(event.error || 'Scan failed', 'error');
@@ -279,9 +313,12 @@ function renderAll() {
   if ($('#networks') && $('#networks').open) renderNetworks();
   renderStats();
   renderScan();
+  renderDiff();
   renderCollectors();
   renderTable();
   renderHistory();
+  renderEventBadge();
+  renderEvents();
   renderFooter();
 }
 
@@ -406,6 +443,74 @@ function renderScan() {
   $('#stop-btn').hidden = !running;
 }
 
+function diffParts(diff) {
+  const counts = (diff && diff.counts) || {};
+  const parts = [];
+  [
+    ['new', 'new'],
+    ['returned', 'returned'],
+    ['offline', 'offline'],
+    ['changed', 'changed'],
+  ].forEach(([key, label]) => {
+    const value = Number(counts[key]) || 0;
+    if (value) parts.push({ key, label, value });
+  });
+  return parts;
+}
+
+function renderDiff() {
+  const host = $('#scan-diff');
+  if (!host) return;
+  const diff = state.latestDiff;
+  if (!diff || state.scan.running) {
+    host.hidden = true;
+    host.innerHTML = '';
+    return;
+  }
+  host.hidden = false;
+  host.className = 'scan-diff';
+  if (diff.baseline) {
+    host.classList.add('baseline');
+    host.innerHTML = `<span class="diff-tag">baseline</span><span class="diff-copy">${plural(Number(diff.current_devices) || 0, 'device')} recorded for future comparisons</span>`;
+    return;
+  }
+  if (diff.partial) {
+    host.classList.add('partial');
+    host.innerHTML = '<span class="diff-tag">partial</span><span class="diff-copy">Scan stopped early · comparison skipped</span>';
+    return;
+  }
+  const parts = diffParts(diff);
+  if (!parts.length) {
+    host.classList.add('quiet');
+    host.innerHTML = '<span class="diff-tag">unchanged</span><span class="diff-copy">No changes since the previous scan</span>';
+    return;
+  }
+  const titles = (diff.changes || []).map((change) => change.title).filter(Boolean).slice(0, 6).join('\n');
+  host.title = titles;
+  host.innerHTML = `<span class="diff-tag">changes</span>${parts
+    .map((part) => `<span class="diff-pill ${esc(part.key)}"><b>${part.value}</b> ${esc(part.label)}</span>`)
+    .join('')}`;
+}
+
+function announceDiff(diff) {
+  if (!diff || !diff.counts) return;
+  const parts = diffParts(diff);
+  if (!parts.length) return;
+  toast(`Changes · ${parts.map((part) => `${part.value} ${part.label}`).join(' · ')}`, 'warn');
+}
+
+function renderEventBadge() {
+  const badge = $('#events-unread');
+  if (!badge) return;
+  const unread = Number(state.events.unread) || 0;
+  badge.hidden = unread <= 0;
+  badge.textContent = unread > 99 ? '99+' : String(unread);
+  const button = $('#events-btn');
+  if (button) {
+    button.title = unread ? `Event center · ${plural(unread, 'unread event')}` : 'Event center';
+  }
+}
+
 function renderCollectors() {
   const host = $('#collectors');
   const html = COLLECTORS.map(([name, label]) => {
@@ -422,6 +527,9 @@ function renderTable() {
   let list = deviceList();
 
   if (!state.prefs.showOffline) list = list.filter((device) => device.online);
+  const trustFilter = state.prefs.trustFilter || 'all';
+  if (trustFilter === 'all') list = list.filter((device) => (device.trust || 'unknown') !== 'ignored');
+  else list = list.filter((device) => (device.trust || 'unknown') === trustFilter);
   if (query) {
     list = list.filter((device) => {
       const haystack = [
@@ -433,6 +541,7 @@ function renderTable() {
         device.mac,
         device.notes,
         device.kind,
+        device.trust,
         ...(device.ports || []),
         ...(device.port_names || []),
         ...(device.mdns_services || []),
@@ -461,9 +570,12 @@ function renderTable() {
       emptyScan.dataset.action = 'scan';
     } else {
       $('#empty-title').textContent = 'No matches';
+      const trustActive = trustFilter !== 'all';
       $('#empty-text').textContent = query
         ? `Nothing matches “${query}”${state.prefs.showOffline ? '' : ' while offline devices are hidden'}.`
-        : 'Offline devices are hidden.';
+        : trustActive
+          ? `No ${TRUST_LABELS[trustFilter] || trustFilter} devices.`
+          : 'Offline devices are hidden.';
       emptyScan.hidden = false;
       emptyScan.textContent = 'Clear filters';
       emptyScan.dataset.action = 'clear';
@@ -511,19 +623,29 @@ function renderHistory() {
 
   if (!scans.length) {
     $('#history-rows').innerHTML =
-      '<tr><td class="history-empty" colspan="6">Run a scan to start the timeline.</td></tr>';
+      '<tr><td class="history-empty" colspan="7">Run a scan to start the timeline.</td></tr>';
   } else {
     $('#history-rows').innerHTML = scans
       .map((scan) => {
         const status = scan.error ? 'error' : scan.stopped ? 'stopped' : 'ok';
         const found = Number(scan.devices_found) || 0;
         const up = Number(scan.hosts_up) || 0;
+        const changes =
+          (Number(scan.new_devices) || 0) +
+          (Number(scan.returned_devices) || 0) +
+          (Number(scan.offline_devices) || 0) +
+          (Number(scan.changed_devices) || 0);
+        const changeText = scan.baseline ? 'base' : changes ? String(changes) : '—';
+        const changeTitle = scan.baseline
+          ? 'First scan for this network'
+          : `${Number(scan.new_devices) || 0} new · ${Number(scan.returned_devices) || 0} returned · ${Number(scan.offline_devices) || 0} offline · ${Number(scan.changed_devices) || 0} changed`;
         return `<tr title="${esc(absolute(scan.finished_at))}">
           <td><span data-ts="${Number(scan.finished_at) || 0}">${ago(scan.finished_at)}</span></td>
           <td class="mono col-history-network">${esc(scan.subnet || '—')}</td>
           <td class="num">${found}</td>
           <td class="num col-history-up">${up}</td>
           <td class="col-history-duration">${formatDuration(scan.duration_s)}</td>
+          <td class="num col-history-changes" title="${esc(changeTitle)}">${changeText}</td>
           <td><span class="status ${status}">${status}</span></td>
         </tr>`;
       })
@@ -599,6 +721,8 @@ function rowHtml(device) {
   const badges = [];
   if (device.is_gateway) badges.push('<span class="badge gw">gateway</span>');
   if (device.is_self) badges.push('<span class="badge self">this device</span>');
+  if (device.trust === 'trusted') badges.push('<span class="badge trusted">trusted</span>');
+  else if (device.trust === 'ignored') badges.push('<span class="badge ignored">ignored</span>');
   if (!online) badges.push('<span class="badge off">offline</span>');
 
   const ports = device.ports || [];
@@ -643,6 +767,183 @@ function renderFooter() {
   $('#state-path').textContent = state.statePath ? `inventory ${state.statePath}` : '';
 }
 
+/* ------------------------------------------------------------------ */
+/* event center                                                        */
+/* ------------------------------------------------------------------ */
+
+const SEVERITY_RANK = { info: 0, notice: 1, warning: 2, critical: 3 };
+
+function eventMatches(event) {
+  const selected = state.events.severity || 'all';
+  const severity = event.severity || 'info';
+  if (selected === 'warning' && (SEVERITY_RANK[severity] || 0) < 2) return false;
+  if (selected === 'warning-only' && severity !== 'warning') return false;
+  if (['info', 'notice', 'critical'].includes(selected) && severity !== selected) return false;
+  if (state.events.unreadOnly && event.read) return false;
+  return true;
+}
+
+function eventHtml(event) {
+  const severity = ['info', 'notice', 'warning', 'critical'].includes(event.severity)
+    ? event.severity
+    : 'info';
+  const ip = event.device_ip ? String(event.device_ip) : '';
+  const clickable = ip && state.devices.has(ip);
+  const title = event.title || event.type || 'Event';
+  return `<li class="event-item sev-${severity} ${event.read ? 'read' : 'unread'}" data-id="${esc(event.id || '')}"${clickable ? ` data-ip="${esc(ip)}"` : ''} tabindex="0">
+      <span class="event-dot" aria-hidden="true"></span>
+      <span class="event-main">
+        <span class="event-title">${esc(title)}</span>
+        ${event.message ? `<span class="event-message">${esc(event.message)}</span>` : ''}
+        <span class="event-meta">${esc(SEVERITY_LABELS[severity] || severity)} · <span data-ts="${Number(event.ts) || 0}">${ago(event.ts)}</span>${ip ? ` · ${esc(ip)}` : ''}${event.type ? ` · ${esc(event.type)}` : ''}</span>
+      </span>
+    </li>`;
+}
+
+function renderEvents() {
+  const list = $('#event-list');
+  const empty = $('#event-empty');
+  const hint = $('#event-hint');
+  if (!list || !empty || !hint) return;
+  const visible = (state.events.items || []).filter(eventMatches);
+  list.innerHTML = visible.map(eventHtml).join('');
+  empty.hidden = visible.length > 0;
+  if (state.events.error) {
+    empty.textContent = `Event log unavailable · ${state.events.error}`;
+  } else if (state.events.items.length) {
+    empty.textContent = 'No events match these filters.';
+  } else {
+    empty.textContent = 'No events yet. Scan twice to see changes between scans.';
+  }
+  const unread = Number(state.events.unread) || 0;
+  const bits = [`${plural(visible.length, 'event')} shown`, `${unread} unread`];
+  if (state.events.path) bits.push(`log ${state.events.path}`);
+  hint.textContent = bits.join(' · ');
+  const more = $('#events-load-more');
+  if (more) more.hidden = !state.events.hasMore;
+  const mark = $('#events-mark-read');
+  if (mark) mark.disabled = unread === 0;
+  renderEventBadge();
+}
+
+function acceptEvent(event) {
+  if (!event) return;
+  const items = state.events.items || [];
+  const index = items.findIndex((item) => item.id != null && item.id === event.id);
+  if (index >= 0) items[index] = { ...items[index], ...event };
+  else {
+    items.unshift(event);
+    if (!event.read) state.events.unread = (Number(state.events.unread) || 0) + 1;
+  }
+  state.events.items = items.slice(0, 100);
+  renderEvents();
+}
+
+async function loadEvents(reset = true, quiet = false) {
+  const params = new URLSearchParams();
+  params.set('limit', '50');
+  const selected = state.events.severity || 'all';
+  if (selected === 'warning') params.set('severity', 'warning,critical');
+  else if (selected === 'warning-only') params.set('severity', 'warning');
+  else if (selected !== 'all') params.set('severity', selected);
+  if (state.events.unreadOnly) params.set('unread', '1');
+  if (state.activeNetwork && state.activeNetwork.id) {
+    params.set('network_id', state.activeNetwork.id);
+  }
+  if (!reset && state.events.items.length) {
+    const last = state.events.items[state.events.items.length - 1];
+    if (last && last.id) params.set('before_id', String(last.id));
+  }
+  try {
+    const data = await api(`/api/event-log?${params.toString()}`);
+    const incoming = data.events || [];
+    if (reset) {
+      state.events.items = incoming;
+    } else {
+      const known = new Set(state.events.items.map((item) => item.id));
+      state.events.items = state.events.items.concat(incoming.filter((item) => !known.has(item.id)));
+    }
+    state.events.unread = Number(data.unread) || 0;
+    state.events.hasMore = !!data.has_more;
+    state.events.path = data.path || state.events.path;
+    state.events.error = data.error || null;
+  } catch (error) {
+    state.events.error = error.message || 'unavailable';
+    if (!quiet) toast(`Event log unavailable: ${state.events.error}`, 'error');
+  }
+  renderEvents();
+}
+
+function openEventCenter() {
+  const dialog = $('#event-center');
+  if (!dialog || dialog.open) return;
+  if (typeof dialog.showModal === 'function') dialog.showModal();
+  else dialog.setAttribute('open', '');
+  loadEvents(true);
+}
+
+function closeEventCenter() {
+  const dialog = $('#event-center');
+  if (!dialog) return;
+  if (typeof dialog.close === 'function') dialog.close();
+  else dialog.removeAttribute('open');
+}
+
+async function markAllEventsRead() {
+  try {
+    const networkId = state.activeNetwork && state.activeNetwork.id;
+    const data = await api('/api/event-log/read', { method: 'POST', body: { all: true, network_id: networkId || null } });
+    state.events.unread = Number(data.unread) || 0;
+    state.events.items = state.events.items.map((item) => ({ ...item, read: true, read_at: item.read_at || Date.now() / 1000 }));
+    renderEvents();
+    toast('Event log marked read');
+  } catch (error) {
+    toast(error.message || 'Could not update events', 'error');
+  }
+}
+
+async function markEventRead(id, element) {
+  if (!id) return;
+  const item = state.events.items.find((event) => String(event.id) === String(id));
+  if (!item || item.read) return;
+  try {
+    const networkId = state.activeNetwork && state.activeNetwork.id;
+    const data = await api('/api/event-log/read', {
+      method: 'POST',
+      body: { ids: [Number(id)], network_id: networkId || null },
+    });
+    item.read = true;
+    item.read_at = Date.now() / 1000;
+    state.events.unread = Number(data.unread) || 0;
+    if (element) element.classList.add('read');
+    renderEventBadge();
+  } catch (_) {
+    /* reading an individual event is best effort */
+  }
+}
+
+function onEventListClick(event) {
+  const item = event.target.closest('.event-item[data-id]');
+  if (!item) return;
+  markEventRead(item.dataset.id, item);
+  const ip = item.dataset.ip;
+  if (ip && state.devices.has(ip)) {
+    closeEventCenter();
+    openDrawer(ip);
+  }
+}
+
+async function loadLatestDiff() {
+  if (state.scan.running) return;
+  try {
+    const data = await api('/api/scan/diff');
+    state.latestDiff = data;
+    renderDiff();
+  } catch (_) {
+    /* no scan yet, or history is unavailable */
+  }
+}
+
 function setSync(connected) {
   const element = $('#sync');
   if (!element) return;
@@ -662,6 +963,7 @@ function openDrawer(ip) {
   state.drawerDirty = false;
   $('#drawer-label').value = device.label || '';
   $('#drawer-notes').value = device.notes || '';
+  $('#drawer-trust').value = device.trust || 'unknown';
   const drawer = $('#drawer');
   drawer.classList.add('open');
   drawer.setAttribute('aria-hidden', 'false');
@@ -699,11 +1001,14 @@ function renderDrawer(device) {
   else badges.push('<span class="badge off">offline</span>');
   if (device.is_gateway) badges.push('<span class="badge gw">gateway</span>');
   if (device.is_self) badges.push('<span class="badge self">this device</span>');
+  if (device.trust === 'trusted') badges.push('<span class="badge trusted">trusted</span>');
+  else if (device.trust === 'ignored') badges.push('<span class="badge ignored">ignored</span>');
   badges.push(`<span class="badge">${esc(KIND_LABELS[device.kind] || device.kind || 'device')}${confidenceHtml(device)}</span>`);
   $('#drawer-badges').innerHTML = badges.join('');
 
   if (document.activeElement !== $('#drawer-label')) $('#drawer-label').value = device.label || '';
   if (document.activeElement !== $('#drawer-notes')) $('#drawer-notes').value = device.notes || '';
+  if (document.activeElement !== $('#drawer-trust')) $('#drawer-trust').value = device.trust || 'unknown';
   renderDrawerStats(device);
 }
 
@@ -812,7 +1117,12 @@ async function saveDrawer() {
   try {
     const result = await api('/api/device', {
       method: 'POST',
-      body: { ip, label: $('#drawer-label').value.trim(), notes: $('#drawer-notes').value.trim() },
+      body: {
+        ip,
+        label: $('#drawer-label').value.trim(),
+        notes: $('#drawer-notes').value.trim(),
+        trust: $('#drawer-trust').value,
+      },
     });
     upsertDevice(result.device);
     renderAll();
@@ -997,6 +1307,8 @@ async function networkAction(action, id, extra = {}) {
     if (action === 'select') {
       await loadState();
       closeNetworks();
+      loadLatestDiff();
+      loadEvents(true, true);
       toast('Switched network');
     } else {
       renderNetworks();
@@ -1064,6 +1376,9 @@ function loadPrefs() {
   state.prefs.sort = ['ip', 'name', 'latency', 'seen', 'services'].includes(state.prefs.sort) ? state.prefs.sort : 'ip';
   state.prefs.autoInterval = [30, 60, 300, 900].includes(Number(state.prefs.autoInterval)) ? Number(state.prefs.autoInterval) : 60;
   state.prefs.autoScan = !!state.prefs.autoScan;
+  state.prefs.trustFilter = ['all', 'trusted', 'unknown', 'ignored'].includes(state.prefs.trustFilter)
+    ? state.prefs.trustFilter
+    : 'all';
 }
 
 function savePrefs() {
@@ -1076,6 +1391,7 @@ function savePrefs() {
 
 function applyPrefs() {
   $('#show-offline').checked = state.prefs.showOffline;
+  $('#trust-filter').value = state.prefs.trustFilter;
   $('#sort').value = state.prefs.sort;
   $('#auto-scan').checked = state.prefs.autoScan;
   $('#auto-interval').value = String(state.prefs.autoInterval);
@@ -1123,6 +1439,8 @@ function bindEvents() {
       $('#search').value = '';
       state.prefs.showOffline = true;
       $('#show-offline').checked = true;
+      state.prefs.trustFilter = 'all';
+      $('#trust-filter').value = 'all';
       savePrefs();
       renderTable();
     } else {
@@ -1160,12 +1478,39 @@ function bindEvents() {
   $('#settings-form').addEventListener('submit', submitSettings);
   $('#opt-target').addEventListener('change', syncSubnetField);
 
+  $('#events-btn').addEventListener('click', openEventCenter);
+  $('#events-close').addEventListener('click', closeEventCenter);
+  $('#events-done').addEventListener('click', closeEventCenter);
+  $('#events-mark-read').addEventListener('click', markAllEventsRead);
+  $('#events-load-more').addEventListener('click', () => loadEvents(false));
+  $('#event-list').addEventListener('click', onEventListClick);
+  $('#event-list').addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    const item = event.target.closest('.event-item[data-id]');
+    if (!item) return;
+    event.preventDefault();
+    onEventListClick({ target: item });
+  });
+  $('#event-severity').addEventListener('change', (event) => {
+    state.events.severity = event.target.value;
+    loadEvents(true, true);
+  });
+  $('#event-unread').addEventListener('change', (event) => {
+    state.events.unreadOnly = event.target.checked;
+    loadEvents(true, true);
+  });
+
   $('#search').addEventListener('input', (event) => {
     state.search = event.target.value;
     renderTable();
   });
   $('#show-offline').addEventListener('change', (event) => {
     state.prefs.showOffline = event.target.checked;
+    savePrefs();
+    renderTable();
+  });
+  $('#trust-filter').addEventListener('change', (event) => {
+    state.prefs.trustFilter = event.target.value;
     savePrefs();
     renderTable();
   });
@@ -1220,6 +1565,9 @@ function bindEvents() {
   $('#drawer-notes').addEventListener('input', () => {
     state.drawerDirty = true;
   });
+  $('#drawer-trust').addEventListener('change', () => {
+    state.drawerDirty = true;
+  });
 
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape') {
@@ -1238,6 +1586,8 @@ function bindEvents() {
     if (!document.hidden) {
       loadState();
       loadHistory();
+      loadLatestDiff();
+      if ($('#event-center') && $('#event-center').open) loadEvents(true, true);
     }
   });
 }
@@ -1287,6 +1637,7 @@ async function init() {
   bindEvents();
   setupAutoScan();
   await Promise.all([loadState(), loadHistory()]);
+  loadLatestDiff();
   connectEvents();
   setInterval(tick, 1000);
 }

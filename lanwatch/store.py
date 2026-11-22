@@ -23,9 +23,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .model import Device, ip_sort_key, normalize_ip
+from .model import Device, ip_sort_key, normalize_ip, validate_trust
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 PLACEHOLDER_ID = "default"
 MAX_LABEL = 60
 
@@ -459,6 +459,19 @@ class Store:
                 device.notes = notes.strip()[:500]
             return device
 
+    def set_trust(self, ip: str, trust: object) -> Device | None:
+        """Set a device's trust level, returning the canonical record."""
+        key = normalize_ip(ip)
+        level = validate_trust(trust)
+        with self.lock:
+            device = self.devices.get(key)
+            if device is None:
+                return None
+            if device.trust != level:
+                device.trust = level
+                device.trust_updated_at = time.time()
+            return device
+
     def forget(self, ip: str) -> bool:
         key = normalize_ip(ip)
         with self.lock:
@@ -479,6 +492,9 @@ class Store:
             "offline": sum(1 for d in devices if not d.online),
             "services": sum(len(d.ports) for d in devices),
             "labeled": sum(1 for d in devices if d.label),
+            "trusted": sum(1 for d in devices if d.trust == "trusted"),
+            "unknown": sum(1 for d in devices if d.trust == "unknown"),
+            "ignored": sum(1 for d in devices if d.trust == "ignored"),
         }
 
     def snapshot(self) -> dict[str, Any]:
@@ -532,6 +548,7 @@ class Store:
                 "first_seen",
                 "last_seen",
                 "notes",
+                "trust",
             ]
         )
         for device in devices:
@@ -550,6 +567,7 @@ class Store:
                     time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(device.first_seen)),
                     time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(device.last_seen)),
                     device.notes.replace("\n", " "),
+                    device.trust,
                 ]
             )
         return buffer.getvalue()

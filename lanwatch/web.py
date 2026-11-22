@@ -26,7 +26,8 @@ from urllib.parse import parse_qs, urlsplit
 
 from . import __version__
 from .discovery import ScanEngine, ScanOptions
-from .model import normalize_ip
+from .events import SEVERITIES
+from .model import normalize_ip, validate_trust
 from .store import Store
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -35,6 +36,8 @@ CLIENT_HEADER = "X-Lanwatch"
 SSE_HEARTBEAT = 12.0
 HISTORY_DEFAULT = 12
 HISTORY_MAX = 200
+EVENT_DEFAULT = 50
+EVENT_MAX = 200
 
 _MIME = {
     ".html": "text/html; charset=utf-8",
@@ -67,6 +70,34 @@ def _history_limit(raw: str) -> int:
     if not 1 <= value <= HISTORY_MAX:
         raise ValueError(f"limit must be between 1 and {HISTORY_MAX}")
     return value
+
+
+def _event_limit(raw: str) -> int:
+    if not raw:
+        return EVENT_DEFAULT
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("limit must be an integer") from exc
+    if not 1 <= value <= EVENT_MAX:
+        raise ValueError(f"limit must be between 1 and {EVENT_MAX}")
+    return value
+
+
+def _positive_int(raw: str, name: str) -> int | None:
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if value < 1:
+        raise ValueError(f"{name} must be positive")
+    return value
+
+
+def _query_flag(raw: str) -> bool:
+    return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -160,6 +191,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 )
             elif path == "/api/history":
                 self._serve_history(parsed.query)
+            elif path == "/api/event-log":
+                self._serve_event_log(parsed.query)
+            elif path == "/api/scan/diff":
+                self._serve_scan_diff(parsed.query)
             elif path in ("/api/export.csv", "/api/export.json"):
                 self._serve_export(path)
             elif path.startswith("/api/"):
@@ -190,6 +225,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json({"ok": True, "stopped": self.engine.stop()})
             elif path == "/api/device":
                 self._update_device(payload)
+            elif path == "/api/event-log/read":
+                self._mark_events_read(payload)
             elif path == "/api/probe":
                 self._probe(payload)
             elif path == "/api/forget":
@@ -354,19 +391,119 @@ class DashboardHandler(BaseHTTPRequestHandler):
             raise ValueError("ip is required")
         label = payload.get("label")
         notes = payload.get("notes")
+        trust = payload.get("trust")
         if label is not None and not isinstance(label, str):
             raise ValueError("label must be a string")
         if notes is not None and not isinstance(notes, str):
             raise ValueError("notes must be a string")
+        if trust is not None:
+            if not isinstance(trust, str):
+                raise ValueError("trust must be a string")
+            validate_trust(trust)
         address = normalize_ip(ip)
         device = self.engine.store.set_user_fields(address, label, notes)
         if device is None:
             self._send_error_json(404, f"unknown device {address}")
             return
-        self.engine.store.save()
-        snapshot = device.to_dict()
-        self.engine._emit("device", device=snapshot)
-        self._send_json({"ok": True, "device": snapshot})
+        if trust is not None:
+            device, message = self.engine.set_device_trust(address, trust)
+            if device is None:
+                self._send_error_json(404, message)
+                return
+        else:
+            self.engine.store.save()
+            snapshot = device.to_dict()
+            self.engine._emit("device", device=snapshot)
+        self._send_json({"ok": True, "device": device.to_dict()})
+
+    def _serve_event_log(self, query: str) -> None:
+        params = parse_qs(query)
+        try:
+            limit = _event_limit(params.get("limit", [""])[0])
+            before_id = _positive_int(params.get("before_id", [""])[0], "before_id")
+            raw_severities = params.get("severity", [""])[0]
+            severities = [item.strip().lower() for item in raw_severities.split(",") if item.strip()]
+            for severity in severities:
+                if severity not in SEVERITIES:
+                    raise ValueError(f"unknown severity {severity!r}")
+            event_type = params.get("type", [""])[0].strip() or None
+            network_id = params.get("network_id", [""])[0].strip() or None
+            device = params.get("device", [""])[0].strip() or None
+            if device:
+                device = normalize_ip(device)
+            unread = _query_flag(params.get("unread", [""])[0])
+        except ValueError as exc:
+            self._send_error_json(400, str(exc))
+            return
+        try:
+            events = self.engine.history.event_log(
+                limit,
+                before_id=before_id,
+                severities=severities,
+                event_type=event_type,
+                network_id=network_id,
+                device=device,
+                unread=unread,
+            )
+            unread_count = self.engine.history.unread_count(network_id)
+        except (OSError, sqlite3.Error) as exc:
+            self._send_error_json(500, f"event log unavailable: {exc}")
+            return
+        self._send_json(
+            {
+                "ok": True,
+                "events": events,
+                "unread": unread_count,
+                "has_more": len(events) >= limit,
+                "path": str(self.engine.history.path),
+                "error": self.engine.event_error or self.engine.history_error,
+            }
+        )
+
+    def _mark_events_read(self, payload: dict[str, Any]) -> None:
+        all_events = payload.get("all", False)
+        if not isinstance(all_events, bool):
+            raise ValueError("all must be a boolean")
+        ids = payload.get("ids")
+        if ids is not None:
+            if not isinstance(ids, list) or len(ids) > EVENT_MAX:
+                raise ValueError(f"ids must be a list of at most {EVENT_MAX} integers")
+            try:
+                ids = [int(value) for value in ids]
+            except (TypeError, ValueError) as exc:
+                raise ValueError("ids must contain integers") from exc
+        if all_events and ids:
+            raise ValueError("use either ids or all, not both")
+        network_id = payload.get("network_id")
+        if network_id is not None and not isinstance(network_id, str):
+            raise ValueError("network_id must be a string")
+        try:
+            marked = self.engine.history.mark_events_read(
+                ids, all_events=all_events, network_id=network_id
+            )
+            unread = self.engine.history.unread_count(network_id)
+        except (OSError, sqlite3.Error) as exc:
+            self._send_error_json(500, f"event log unavailable: {exc}")
+            return
+        self._send_json({"ok": True, "marked": marked, "unread": unread})
+
+    def _serve_scan_diff(self, query: str) -> None:
+        try:
+            scan_id = _positive_int(
+                parse_qs(query).get("scan_id", [""])[0], "scan_id"
+            )
+        except ValueError as exc:
+            self._send_error_json(400, str(exc))
+            return
+        try:
+            payload = self.engine.scan_diff(scan_id)
+        except (OSError, sqlite3.Error) as exc:
+            self._send_error_json(500, f"scan comparison unavailable: {exc}")
+            return
+        if payload is None:
+            self._send_error_json(404, "no recorded scan to compare")
+            return
+        self._send_json({"ok": True, **payload, "error": None})
 
     def _probe(self, payload: dict[str, Any]) -> None:
         ip = payload.get("ip")
@@ -400,14 +537,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.end_headers()
         channel = self.engine.bus.subscribe()
         try:
-            self._write_event(
-                {
-                    "type": "hello",
-                    "ts": time.time(),
-                    "state": self.engine.state_dict(),
-                    "version": __version__,
-                }
-            )
+            hello: dict[str, Any] = {
+                "type": "hello",
+                "ts": time.time(),
+                "state": self.engine.state_dict(),
+                "version": __version__,
+            }
+            try:
+                hello["unread"] = self.engine.history.unread_count(
+                    self.engine.store.active_id
+                )
+            except (OSError, sqlite3.Error):
+                hello["unread"] = 0
+            if self.engine.last_diff is not None:
+                hello["latest_diff"] = self.engine.last_diff
+            self._write_event(hello)
             while True:
                 try:
                     event = channel.get(timeout=SSE_HEARTBEAT)

@@ -15,8 +15,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import __version__, collectors, netif, oui
+from .changes import ScanDiff, SnapshotDevice, compare_snapshots
+from .events import events_for_diff, scan_failure_event, trust_event
 from .history import HistoryStore, default_history_path
-from .model import Device, normalize_ip
+from .model import Device, normalize_ip, validate_trust
 from .store import Store
 
 COLLECTOR_ORDER = ("icmp", "arp", "tcp", "http", "mdns", "ssdp", "nbns", "rdns")
@@ -186,6 +188,8 @@ class ScanEngine:
         self.store = store
         self.history = history or HistoryStore(default_history_path(store.path))
         self.history_error: str | None = None
+        self.event_error: str | None = None
+        self.last_diff: dict[str, Any] | None = None
         self.bus = EventBus()
         self.options = options or ScanOptions()
         self._lock = threading.RLock()
@@ -334,6 +338,17 @@ class ScanEngine:
         data["interfaces"] = [iface.to_dict() for iface in self._interfaces]
         data["version"] = __version__
         data["history"] = {"path": str(self.history.path), "error": self.history_error}
+        try:
+            unread = self.history.unread_count(self.store.active_id)
+        except (OSError, sqlite3.Error):
+            unread = 0
+        data["events"] = {
+            "path": str(self.history.path),
+            "error": self.event_error or self.history_error,
+            "unread": unread,
+        }
+        if self.last_diff is not None:
+            data["latest_diff"] = self.last_diff
         data["host"] = {
             "name": platform.node(),
             "system": platform.system(),
@@ -353,6 +368,7 @@ class ScanEngine:
             self._scan_id += 1
             scan_id = self._scan_id
             self._cancel.clear()
+            self.last_diff = None
             self.state = {
                 "running": True,
                 "phase": "starting",
@@ -411,6 +427,90 @@ class ScanEngine:
         snapshot = device.to_dict()
         self._emit("device", device=snapshot)
         return snapshot
+
+    def set_device_trust(self, ip: str, trust: object) -> tuple[Device | None, str]:
+        """Set trust, persist it and publish a durable trust-change event."""
+        address = normalize_ip(ip)
+        level = validate_trust(trust)
+        with self.store.lock:
+            current = self.store.devices.get(address)
+            previous = current.trust if current is not None else None
+        device = self.store.set_trust(address, level)
+        if device is None:
+            return None, f"unknown device {address}"
+        self.store.save()
+        snapshot = device.to_dict()
+        self._emit("device", device=snapshot)
+        if previous is not None and previous != device.trust:
+            event = trust_event(device, previous, self.store.active_id)
+            try:
+                self.history.record_event(event)
+                self.event_error = None
+            except (OSError, sqlite3.Error) as exc:
+                self.event_error = str(exc)
+            self._emit("event.new", event=event.to_dict())
+        return device, ""
+
+    def scan_diff(self, scan_id: int | None = None) -> dict[str, Any] | None:
+        """Recompute the diff for a recorded scan, or the latest completed one."""
+        network = self.store.network or {}
+        network_id = network.get("network_id") or self.store.active_id
+        subnet = network.get("cidr") or self.state.get("subnet")
+        if scan_id is None:
+            target = self.history.previous_snapshot(network_id, subnet)
+        else:
+            target = self.history.scan_snapshot(int(scan_id))
+        if not isinstance(target, dict):
+            return None
+        target_id = int(target.get("id") or 0)
+        if not target_id:
+            return None
+        target_network_id = target.get("network_id") or network_id
+        target_subnet = target.get("subnet") or subnet
+        if target.get("stopped") or target.get("error"):
+            diff = compare_snapshots(
+                None,
+                target.get("devices") or [],
+                baseline=False,
+                partial=True,
+            )
+        else:
+            previous = self.history.previous_snapshot(
+                target_network_id, target_subnet, before_scan_id=target_id
+            )
+            with self.store.lock:
+                trust_map = {
+                    device.ip: device.trust for device in self.store.devices.values()
+                }
+
+            def returning(ip: str) -> bool:
+                previous_id = previous.get("id") if isinstance(previous, dict) else None
+                return bool(
+                    previous_id
+                    and self.history.seen_before(
+                        target_network_id, target_subnet, ip, int(previous_id)
+                    )
+                )
+
+            diff = compare_snapshots(
+                previous.get("devices") if isinstance(previous, dict) else None,
+                target.get("devices") or [],
+                previous_scan_id=(
+                    int(previous["id"]) if isinstance(previous, dict) else None
+                ),
+                baseline=not isinstance(previous, dict),
+                inventory_trust=trust_map,
+                is_returning=returning,
+            )
+        payload = diff.to_dict()
+        payload.update(
+            {
+                "scan_id": target_id,
+                "network_id": target_network_id,
+                "scan": target,
+            }
+        )
+        return payload
 
     # -- internals -------------------------------------------------------
 
@@ -740,6 +840,7 @@ class ScanEngine:
                 # Publish and persist before clearing "running": observers that
                 # wait for the scan to stop must not race the final write.
                 self._emit("scan.error", error=error, state=state)
+                self._record_scan_failure(error)
                 self._emit("scan.finished", state=state, counts=self.store.counts())
                 self.store.save()
                 if finished_here:
@@ -923,29 +1024,88 @@ class ScanEngine:
     def _record_history(
         self, state: dict[str, Any], seen: set[str], stopped: bool
     ) -> None:
-        """Write a completed scan to SQLite without ever failing the scan."""
+        """Write a completed scan, its diff and events without failing the scan."""
         network = self.store.network or {}
+        network_id = network.get("network_id") or self.store.active_id
+        subnet = network.get("cidr") or state.get("subnet")
         with self.store.lock:
             devices = [
                 self.store.devices[ip]
                 for ip in sorted(seen)
                 if ip in self.store.devices
             ]
+            trust_map = {
+                device.ip: device.trust for device in self.store.devices.values()
+            }
         try:
-            self.history.record_scan(
+            diff: ScanDiff | None = None
+            previous: dict[str, Any] | None = None
+            if not stopped:
+                candidate = self.history.previous_snapshot(network_id, subnet)
+                previous = candidate if isinstance(candidate, dict) else None
+
+                def returning(ip: str) -> bool:
+                    previous_id = previous.get("id") if previous is not None else None
+                    return bool(
+                        previous_id
+                        and self.history.seen_before(
+                            network_id, subnet, ip, int(previous_id)
+                        )
+                    )
+
+                diff = compare_snapshots(
+                    previous.get("devices") if previous is not None else None,
+                    [SnapshotDevice.from_device(device) for device in devices],
+                    previous_scan_id=(
+                        int(previous["id"]) if previous is not None else None
+                    ),
+                    baseline=previous is None,
+                    inventory_trust=trust_map,
+                    is_returning=returning,
+                )
+            events = events_for_diff(diff, network_id) if diff is not None else []
+            scan_row_id = self.history.record_scan(
                 devices,
                 started_at=float(state.get("started_at") or time.time()),
                 finished_at=float(state.get("finished_at") or time.time()),
                 duration_s=state.get("duration_s"),
-                subnet=network.get("cidr") or state.get("subnet"),
+                subnet=subnet,
                 interface=network.get("interface"),
                 hosts_total=int(state.get("hosts_total") or 0),
                 hosts_up=int(network.get("hosts_up") or len(seen)),
                 stopped=stopped,
+                network_id=network_id,
+                baseline=bool(diff.baseline) if diff is not None else False,
+                new_devices=diff.new_devices if diff is not None else 0,
+                returned_devices=diff.returned_devices if diff is not None else 0,
+                offline_devices=diff.offline_devices if diff is not None else 0,
+                changed_devices=diff.changed_devices if diff is not None else 0,
+                events=events,
             )
             self.history_error = None
-        except (OSError, sqlite3.Error) as exc:
+            if diff is not None:
+                payload = diff.to_dict()
+                payload.update(
+                    {
+                        "scan_id": scan_row_id,
+                        "network_id": network_id,
+                        "previous_scan_id": diff.previous_scan_id,
+                    }
+                )
+                self.last_diff = payload
+                self._emit("scan.diff", **payload)
+        except (OSError, sqlite3.Error, ValueError, TypeError) as exc:
             self.history_error = str(exc)
+
+    def _record_scan_failure(self, error: str) -> None:
+        """Best-effort durable event for a scan that never completed."""
+        event = scan_failure_event(error, self.store.active_id)
+        try:
+            self.history.record_event(event)
+            self.event_error = None
+        except (OSError, sqlite3.Error) as exc:
+            self.event_error = str(exc)
+        self._emit("event.new", event=event.to_dict())
 
 
 def _collect_banners(open_map: dict[str, list[int]]) -> dict[str, dict[str, str]]:

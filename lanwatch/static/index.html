@@ -39,6 +39,12 @@
         </button>
 
         <div class="btn-group">
+          <button class="btn ghost icon-only events-btn" id="events-btn" aria-label="Event center" title="Event center" aria-haspopup="dialog">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9"/><path d="M10 21h4"/>
+            </svg>
+            <span class="unread-badge" id="events-unread" hidden>0</span>
+          </button>
           <div class="menu-wrap">
             <button class="btn ghost" id="export-btn" aria-haspopup="menu" aria-expanded="false">
               <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -105,6 +111,7 @@
           <span class="sync" id="sync" title="Live event stream">connecting…</span>
         </div>
         <div class="progress" aria-hidden="true"><span id="progress-bar"></span></div>
+        <div class="scan-diff" id="scan-diff" hidden></div>
         <div class="collectors" id="collectors" aria-label="Discovery sources"></div>
       </section>
 
@@ -119,6 +126,12 @@
           </div>
           <div class="toolbar-right">
             <label class="check"><input type="checkbox" id="show-offline" checked><span>Offline</span></label>
+            <select id="trust-filter" aria-label="Filter by trust">
+              <option value="all">Trust · all</option>
+              <option value="trusted">Trusted</option>
+              <option value="unknown">Unknown</option>
+              <option value="ignored">Ignored</option>
+            </select>
             <span class="sep" aria-hidden="true"></span>
             <label class="check"><input type="checkbox" id="auto-scan"><span>Auto</span></label>
             <select id="auto-interval" aria-label="Auto-scan interval">
@@ -186,6 +199,7 @@
                 <th class="num">Found</th>
                 <th class="col-history-up num">Up</th>
                 <th class="col-history-duration">Duration</th>
+                <th class="num col-history-changes">Changes</th>
                 <th>Status</th>
               </tr>
             </thead>
@@ -222,6 +236,14 @@
           <span>Label</span>
           <input id="drawer-label" maxlength="60" placeholder="e.g. Living room TV" autocomplete="off">
         </label>
+        <label class="field">
+          <span>Trust</span>
+          <select id="drawer-trust">
+            <option value="trusted">Trusted</option>
+            <option value="unknown">Unknown</option>
+            <option value="ignored">Ignored</option>
+          </select>
+        </label>
         <dl class="kv" id="drawer-identity"></dl>
       </section>
       <section>
@@ -251,6 +273,34 @@
       </section>
     </div>
   </aside>
+
+  <dialog class="dialog event-dialog" id="event-center" aria-labelledby="events-title">
+    <div class="dialog-head">
+      <h2 id="events-title">Event center</h2>
+      <button class="icon-btn" type="button" id="events-close" aria-label="Close event center">×</button>
+    </div>
+    <div class="dialog-body event-body">
+      <div class="event-toolbar">
+        <select id="event-severity" aria-label="Filter events by severity">
+          <option value="all">All severities</option>
+          <option value="warning">Warning and above</option>
+          <option value="info">Info</option>
+          <option value="notice">Notice</option>
+          <option value="warning-only">Warnings</option>
+          <option value="critical">Critical</option>
+        </select>
+        <label class="check"><input type="checkbox" id="event-unread"><span>Unread</span></label>
+        <button class="btn ghost small" type="button" id="events-mark-read">Mark all read</button>
+      </div>
+      <div class="event-list" id="event-list"></div>
+      <p class="event-empty" id="event-empty">No events yet. Scan twice to see changes between scans.</p>
+      <p class="dialog-note" id="event-hint"></p>
+    </div>
+    <div class="dialog-actions">
+      <button class="btn ghost" type="button" id="events-load-more" hidden>Load more</button>
+      <button class="btn primary" type="button" id="events-done">Done</button>
+    </div>
+  </dialog>
 
   <dialog class="dialog" id="settings">
     <form id="settings-form">

@@ -19,6 +19,12 @@ from . import fingerprint
 # Where a hostname came from, best source wins.
 HOSTNAME_RANK = {"mdns": 5, "ssdp": 4, "nbns": 3, "pcb": 3, "rdns": 2}
 
+# User-assigned trust.  This is deliberately separate from labels/notes: it is
+# used to decide whether a change is worth an alert, never to hide a device
+# from the inventory or from scans.
+TRUST_LEVELS = ("trusted", "unknown", "ignored")
+DEFAULT_TRUST = "unknown"
+
 # Well-known ports shown in the UI next to a device.
 PORT_NAMES = {
     21: "ftp",
@@ -69,6 +75,23 @@ def normalize_ip(value: str) -> str:
     return str(addr)
 
 
+def validate_trust(value: object) -> str:
+    """Return a canonical trust level, raising ValueError for unknown values."""
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in TRUST_LEVELS:
+            return text
+    raise ValueError("trust must be one of: trusted, unknown, ignored")
+
+
+def normalize_trust(value: object) -> str:
+    """Best-effort trust parser for loading old or hand-edited snapshots."""
+    try:
+        return validate_trust(value)
+    except ValueError:
+        return DEFAULT_TRUST
+
+
 def _merge_unique(existing: list[str], incoming: Iterable[str]) -> list[str]:
     seen = list(existing)
     lowered = {item.lower() for item in seen}
@@ -100,6 +123,8 @@ class Device:
     sources: list[str] = field(default_factory=list)
     label: str | None = None
     notes: str = ""
+    trust: str = DEFAULT_TRUST
+    trust_updated_at: float | None = None
     online: bool = False
     first_seen: float = field(default_factory=time.time)
     last_seen: float = field(default_factory=time.time)
@@ -213,6 +238,8 @@ class Device:
             "name": name,
             "label": self.label,
             "notes": self.notes,
+            "trust": self.trust,
+            "trust_updated_at": self.trust_updated_at,
             "hostname": self.hostname,
             "hostname_source": self.hostname_source,
             "nbns_name": self.nbns_name,
@@ -267,6 +294,13 @@ class Device:
         device.sources = [str(s) for s in raw.get("sources") or []]
         device.label = raw.get("label") or None
         device.notes = str(raw.get("notes") or "")
+        device.trust = normalize_trust(raw.get("trust"))
+        updated = raw.get("trust_updated_at")
+        device.trust_updated_at = (
+            float(updated)
+            if isinstance(updated, (int, float)) and not isinstance(updated, bool)
+            else None
+        )
         device.online = bool(raw.get("online"))
         device.first_seen = float(raw.get("first_seen") or time.time())
         device.last_seen = float(raw.get("last_seen") or device.first_seen)

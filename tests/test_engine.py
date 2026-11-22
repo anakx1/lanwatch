@@ -241,6 +241,65 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(visits[0]["ports"], [80, 443])
         self.assertEqual(visits[0]["latency_ms"], 3.0)
 
+    def test_scan_comparison_and_events_are_recorded(self) -> None:
+        record = self.store.activate("10.0.0.0/24")
+        self.store.set_network(
+            {
+                "cidr": "10.0.0.0/24",
+                "interface": "wlan0",
+                "address": "10.0.0.5",
+                "network_id": record.id,
+            }
+        )
+        self.engine.history.record_scan(
+            [
+                Device(ip="10.0.0.1", hostname="ROUTER", ports=[80, 443], online=True),
+                Device(ip="10.0.0.77", hostname="OLD", online=True),
+            ],
+            started_at=1.0,
+            finished_at=2.0,
+            subnet="10.0.0.0/24",
+            network_id=record.id,
+            baseline=True,
+        )
+
+        self.run_scan()
+        diff = self.engine.last_diff
+        assert diff is not None
+        self.assertFalse(diff["baseline"])
+        self.assertEqual(diff["counts"]["new"], 3)
+        self.assertEqual(diff["counts"]["offline"], 1)
+        self.assertEqual(diff["counts"]["changed"], 0)
+        events = self.engine.history.event_log(20)
+        types = {event["type"] for event in events}
+        self.assertIn("device.new", types)
+        self.assertIn("device.offline", types)
+        self.assertGreater(self.engine.history.unread_count(), 0)
+
+        self.run_scan()
+        diff = self.engine.last_diff
+        assert diff is not None
+        self.assertEqual(sum(diff["counts"].values()), 0)
+
+    def test_trust_change_is_persisted_and_published(self) -> None:
+        self.run_scan()
+        channel = self.engine.bus.subscribe()
+        device, message = self.engine.set_device_trust("10.0.0.1", "trusted")
+        self.assertEqual(message, "")
+        assert device is not None
+        self.assertEqual(device.trust, "trusted")
+        self.assertEqual(self.store.devices["10.0.0.1"].trust, "trusted")
+        kinds = []
+        while not channel.empty():
+            kinds.append(channel.get_nowait()["type"])
+        self.assertIn("device", kinds)
+        self.assertIn("event.new", kinds)
+        events = self.engine.history.event_log(10)
+        self.assertEqual(events[0]["type"], "device.trust_changed")
+        self.assertEqual(events[0]["details"]["after"], "trusted")
+        with self.assertRaises(ValueError):
+            self.engine.set_device_trust("10.0.0.1", "owner")
+
     def test_stopped_scan_is_recorded(self) -> None:
         def stop_sweep(
             hosts: list[str],
@@ -304,6 +363,10 @@ class EngineTests(unittest.TestCase):
         state = self.engine.state_dict()
         self.assertEqual(state["phase"], "error")
         self.assertIn("no LAN", state["error"] or "")
+        self.assertEqual(self.engine.history.recent(5), [])
+        events = self.engine.history.event_log(5)
+        self.assertEqual(events[0]["type"], "scan.failed")
+        self.assertEqual(events[0]["severity"], "warning")
 
 
 if __name__ == "__main__":

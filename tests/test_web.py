@@ -140,6 +140,66 @@ class WebTests(unittest.TestCase):
             self.assertEqual(status, 400, query)
             self.assertFalse(json.loads(body)["ok"])
 
+    def test_trust_event_log_and_scan_diff_endpoints(self) -> None:
+        status, _, body = self.request("/api/scan/diff")
+        self.assertEqual(status, 404, body)
+
+        self.start_scan()
+        data = self.state()
+        self.assertIn("events", data)
+        self.assertGreaterEqual(data["events"]["unread"], 1)
+        self.assertTrue(data["latest_diff"]["baseline"])
+
+        status, _, body = self.request(
+            "/api/device",
+            "POST",
+            {"ip": "10.0.0.1", "trust": "trusted"},
+            HEADERS,
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["device"]["trust"], "trusted")
+
+        status, _, _ = self.request(
+            "/api/device",
+            "POST",
+            {"ip": "10.0.0.1", "trust": "owner"},
+            HEADERS,
+        )
+        self.assertEqual(status, 400)
+
+        status, _, body = self.request("/api/event-log")
+        self.assertEqual(status, 200, body)
+        log = json.loads(body)
+        self.assertTrue(log["ok"])
+        self.assertTrue(log["events"])
+        self.assertEqual(log["events"][0]["type"], "device.trust_changed")
+        self.assertEqual(log["events"][0]["details"]["after"], "trusted")
+        event_id = log["events"][0]["id"]
+
+        status, _, body = self.request(
+            "/api/event-log/read", "POST", {"ids": [event_id]}, HEADERS
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["marked"], 1)
+
+        status, _, body = self.request("/api/event-log?limit=0")
+        self.assertEqual(status, 400, body)
+        status, _, body = self.request("/api/event-log?severity=bogus")
+        self.assertEqual(status, 400, body)
+
+        status, _, body = self.request("/api/scan/diff")
+        self.assertEqual(status, 200, body)
+        diff = json.loads(body)
+        self.assertTrue(diff["baseline"])
+        self.assertEqual(diff["scan_id"], diff["scan"]["id"])
+        self.assertEqual(diff["scan"]["devices_found"], 4)
+
+        status, _, body = self.request(
+            "/api/event-log/read", "POST", {"all": True}, HEADERS
+        )
+        self.assertEqual(status, 200, body)
+        self.assertEqual(json.loads(body)["unread"], 0)
+
     def test_history_endpoint_reports_read_errors(self) -> None:
         self.engine.history.recent = unittest.mock.Mock(side_effect=OSError("read-only"))
         status, _, body = self.request("/api/history")
@@ -155,6 +215,10 @@ class WebTests(unittest.TestCase):
         self.assertIn("Scan history", text)
         self.assertIn('id="history-rows"', text)
         self.assertIn('id="history-spark"', text)
+        self.assertIn('id="event-center"', text)
+        self.assertIn('id="events-btn"', text)
+        self.assertIn('id="drawer-trust"', text)
+        self.assertIn('id="trust-filter"', text)
 
     def test_mutations_require_header_and_matching_origin(self) -> None:
         status, _, _ = self.request("/api/scan", "POST", {})
@@ -237,6 +301,7 @@ class WebTests(unittest.TestCase):
             event = json.loads(line[len("data: ") :])
             self.assertEqual(event["type"], "hello")
             self.assertIn("state", event)
+            self.assertIn("unread", event)
         finally:
             connection.close()
 

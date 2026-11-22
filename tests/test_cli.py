@@ -13,6 +13,7 @@ import unittest.mock
 from pathlib import Path
 
 from lanwatch import cli
+from lanwatch.events import Event
 from lanwatch.history import HistoryStore, default_history_path
 from lanwatch.model import Device
 
@@ -94,6 +95,64 @@ class HistoryCommandTests(unittest.TestCase):
         self.assertEqual(args.func, cli.cmd_history)
         self.assertEqual(args.limit, 3)
         self.assertIn("history", cli.COMMANDS)
+
+        trust_args = parser.parse_args(["trust", "10.0.0.1", "trusted"])
+        self.assertEqual(trust_args.func, cli.cmd_trust)
+        self.assertEqual(trust_args.level, "trusted")
+        self.assertIn("trust", cli.COMMANDS)
+
+        event_args = parser.parse_args(["events", "--unread", "--json"])
+        self.assertEqual(event_args.func, cli.cmd_events)
+        self.assertTrue(event_args.unread)
+        self.assertIn("events", cli.COMMANDS)
+
+    def test_trust_command_updates_store_and_event_log(self) -> None:
+        from lanwatch.store import Store
+
+        store = Store(self.state)
+        store.activate("10.0.0.0/24")
+        store.upsert(Device(ip="10.0.0.1", online=True))
+        self.assertTrue(store.save())
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = cli.cmd_trust(
+                argparse.Namespace(state=str(self.state), ip="10.0.0.1", level="trusted")
+            )
+        self.assertEqual(code, 0)
+        self.assertIn("trusted", output.getvalue())
+        again = Store(self.state)
+        self.assertEqual(again.devices["10.0.0.1"].trust, "trusted")
+
+        history = HistoryStore(default_history_path(self.state))
+        events = history.event_log(10)
+        self.assertEqual(events[0]["type"], "device.trust_changed")
+        self.assertEqual(events[0]["details"]["after"], "trusted")
+
+    def test_events_command(self) -> None:
+        self.history.record_event(
+            Event(
+                type="device.new",
+                severity="warning",
+                title="New device: camera",
+                message="10.0.0.7",
+                device_ip="10.0.0.7",
+            )
+        )
+        args = argparse.Namespace(
+            state=str(self.state),
+            limit=10,
+            severity="warning",
+            type=None,
+            device=None,
+            unread=False,
+            json=False,
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = cli.cmd_events(args)
+        self.assertEqual(code, 0)
+        self.assertIn("New device: camera", output.getvalue())
 
 
 if __name__ == "__main__":

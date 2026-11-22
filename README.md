@@ -3,11 +3,13 @@
 Discover the devices on your LAN and watch them live in a browser.
 
 `lanwatch` is a **zero-dependency** Python tool: one process, one JSON
-inventory, a SQLite history file, and a small web dashboard served by the
-standard library. It combines active probing (ICMP sweep, TCP port scan, web
+inventory, a SQLite history and event log, and a small web dashboard served by
+the standard library. It combines active probing (ICMP sweep, TCP port scan, web
 fingerprinting) with passive sources (ARP/neighbour table, mDNS, SSDP/UPnP,
 NetBIOS, reverse DNS) and tells you honestly which of them actually worked on
-your network.
+your network. Devices can be marked trusted or ignored, and each completed scan
+is compared with the previous one to record new, returned, offline and changed
+devices in the dashboard's Event Center.
 
 ```
 $ lanwatch
@@ -115,10 +117,13 @@ MAC (same CIDR with a different gateway MAC is a different network).
 
 - Live device table over Server-Sent Events (`/api/events`) — no polling.
 - Collector status chips: see at a glance what worked on this network.
-- Filters (all / online / named / known vendor), sorting, and search.
+- Filters (offline visibility, trust level), sorting, and search.
 - Network switcher with per-network inventories (see [Networks](#networks)).
 - Device kind icons, confidence, and the evidence behind each guess.
-- Device drawer: rename, add notes, run an on-demand port probe, forget.
+- Device drawer: rename, set trust, add notes, run an on-demand port probe,
+  forget.
+- Scan comparison banner: new, returned, offline and changed devices.
+- Event Center: durable, filterable history of changes with unread counts.
 - Scan settings dialog: subnet, ports, timeout, concurrency, deep mode,
   per-collector toggles — applied to the next scan.
 - Scan history: a live trend bar chart and recent-scan table backed by SQLite.
@@ -134,10 +139,12 @@ lanwatch [--state PATH] <command> ...
 
   scan [subnet]     discover devices once
   watch             scan repeatedly (-i SECONDS, default 30)
-  devices           list the saved inventory
+  devices           list the saved inventory (--trust LEVEL)
   history           show recent scans (--limit, --device IP, --json)
+  events            show the persistent Event Center log
   web               serve the web dashboard
   label IP [NAME]   give a device a friendly name (--notes)
+  trust IP LEVEL    mark a device trusted, unknown or ignored
   forget IP         remove a device
   version           print the version
 ```
@@ -149,8 +156,11 @@ lanwatch scan --json > snapshot.json     # full snapshot
 lanwatch scan --csv                      # inventory as CSV
 lanwatch scan --all                      # include offline devices
 lanwatch devices --online --verbose
+lanwatch devices --trust ignored
 lanwatch history --limit 10              # recent scans
 lanwatch history --device 192.168.1.24   # one device's presence history
+lanwatch events --unread                 # durable change log
+lanwatch trust 192.168.1.24 trusted
 lanwatch web --port 8799 --no-open --scan
 ```
 
@@ -167,16 +177,19 @@ All responses are JSON unless noted. `GET` endpoints are read-only.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | GET | `/api/state` | Full snapshot: devices, scan status, collectors, settings |
-| GET | `/api/events` | SSE stream of snapshots (`text/event-stream`) |
+| GET | `/api/events` | SSE stream of live events (`text/event-stream`) |
 | GET | `/api/health` | `{ok, version, time}` |
 | GET | `/api/network` | Detected interfaces and current network |
 | GET | `/api/networks` | Saved networks and the active one |
 | GET | `/api/history?limit=N` | Recent scans (1–200, default 12) |
+| GET | `/api/event-log` | Durable events (`limit`, `before_id`, `severity`, `type`, `network_id`, `device`, `unread`) |
+| GET | `/api/scan/diff?scan_id=N` | Comparison for a scan, or the latest completed scan |
 | GET | `/api/export.csv` | Inventory as CSV |
 | GET | `/api/export.json` | Inventory as JSON |
 | POST | `/api/scan` | Start a scan; body may contain scan options |
 | POST | `/api/stop` | Cancel the running scan |
-| POST | `/api/device` | Update `{ip, label?, notes?}` |
+| POST | `/api/device` | Update `{ip, label?, notes?, trust?}` |
+| POST | `/api/event-log/read` | Mark `{ids}` or `{all: true}` events read (`network_id` optional) |
 | POST | `/api/probe` | Probe `{ip, ports?}` on demand |
 | POST | `/api/forget` | Remove `{ip}` |
 | POST | `/api/interfaces` | Re-detect interfaces |
@@ -223,12 +236,57 @@ lanwatch history --json
 ```
 
 The `scans` table stores the network, start/finish times, duration, host and
-device counts, and a stopped/error flag. `scan_devices` stores the snapshot of
-each device seen in that scan, so per-device presence and services are
-available even after the device disappears from the inventory. History is
-shared across networks — each row records its scanned subnet — and is capped at
-the newest 500 scans to keep the database small. SQLite is part of the Python
-standard library, so this adds no dependency.
+device counts, a stopped/error flag, and the comparison counts. `scan_devices`
+stores the snapshot of each device seen in that scan, so per-device presence
+and services are available even after the device disappears from the inventory.
+History is shared across networks — each row records its scanned network and
+subnet — and is capped at the newest 500 scans to keep the database small.
+SQLite is part of the Python standard library, so this adds no dependency.
+
+## Trust and change detection
+
+Trust is user-assigned and stored with the device in its network inventory:
+
+- **trusted** — expected gear; offline and service changes are warnings.
+- **unknown** — the default. Changes are recorded, but with a lower severity.
+- **ignored** — still scanned and kept in the inventory, but hidden from the
+  default device list and excluded from change events and alerts.
+
+Set it in the device drawer or with `lanwatch trust IP trusted|unknown|ignored`.
+Collectors never overwrite trust, and the dashboard's trust filter can show
+ignored devices when you need them.
+
+After every completed scan, `lanwatch` compares the snapshot with the previous
+completed scan on the same network. The first completed scan is a **baseline**
+and deliberately does not emit one “new device” event per host. Later scans
+record:
+
+- devices that are genuinely new, or that were seen in an older scan and
+  returned after an absence;
+- devices that went offline;
+- the same IP with a different MAC (possible replacement);
+- the same MAC on a new IP (DHCP move);
+- hostname and open-service changes.
+
+Stopped scans are recorded but never used as a comparison baseline. Failed
+scans do not create a history row; they add a `scan.failed` event instead.
+Comparison logic lives in `lanwatch/changes.py` and does no I/O.
+
+## Event Center
+
+Durable events share the history database (`events` table) and survive browser
+reloads and process restarts. The dashboard bell shows unread counts; the Event
+Center can filter by severity and unread state, open the related device, and
+mark events read. Events can also be read from the CLI and API:
+
+```bash
+lanwatch events
+lanwatch events --severity warning,critical --unread
+lanwatch events --device 192.168.1.24 --json
+```
+
+Events are capped at the newest 5,000 and pruned after 180 days. `scan.failed`
+events are recorded without a scan row and are not used for comparison.
 
 ## Running on Android / Termux
 
@@ -259,7 +317,7 @@ On a normal Linux machine all collectors usually work, with or without root.
 ## Tests and development
 
 ```bash
-python3 -m unittest discover -s tests -t .   # 141 tests
+python3 -m unittest discover -s tests -t .   # 165 tests
 ruff check .
 mypy
 ```
@@ -271,9 +329,11 @@ Layout:
 ```
 bin/lanwatch          launcher for a checkout
 lanwatch/
+  changes.py          pure scan-to-scan comparison
   cli.py              argparse commands and table rendering
   discovery.py        scan engine, options, event bus
-  history.py          SQLite scan history and trends
+  events.py           durable event model and event builders
+  history.py          SQLite scan history, events and migrations
   collectors.py       ICMP, ARP, TCP, HTTP, mDNS, SSDP, NBNS, rDNS primitives
   dnsparse.py         minimal DNS packet codec (no dnspython)
   fingerprint.py      device kind, confidence and evidence from signals

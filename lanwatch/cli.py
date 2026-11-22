@@ -16,11 +16,23 @@ from typing import Any
 
 from . import __version__, collectors, netif, web
 from .discovery import ScanEngine, ScanOptions
+from .events import SEVERITIES, trust_event
 from .history import HistoryStore, default_history_path
-from .model import PORT_NAMES, Device, normalize_ip
+from .model import PORT_NAMES, Device, normalize_ip, validate_trust
 from .store import Store
 
-COMMANDS = {"scan", "watch", "devices", "history", "web", "label", "forget", "version"}
+COMMANDS = {
+    "scan",
+    "watch",
+    "devices",
+    "history",
+    "events",
+    "web",
+    "label",
+    "forget",
+    "trust",
+    "version",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +126,8 @@ def render_table(devices: list[Device], show_offline: bool = True, verbose: bool
         lines.append(line)
         if verbose:
             details = []
+            if device.trust != "unknown":
+                details.append(f"trust {device.trust}")
             if device.hostname:
                 details.append(f"hostname {device.hostname} ({device.hostname_source})")
             if device.mac:
@@ -204,6 +218,27 @@ def render_device_history(ip: str, visits: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def render_events(events: list[dict[str, Any]]) -> str:
+    if not events:
+        return "No events recorded yet.\nEvents appear after scans discover changes."
+    lines = []
+    for event in events:
+        when = _history_time(event.get("ts"))
+        severity = str(event.get("severity") or "info")
+        color = {"info": "2", "notice": "36", "warning": "33", "critical": "31"}.get(
+            severity, "2"
+        )
+        marker = "*" if not event.get("read") else " "
+        title = _truncate(str(event.get("title") or event.get("type") or "event"), 62)
+        lines.append(
+            f"{marker} {when:<16} {_style(f'{severity:<8}', color)} {title}"
+        )
+        message = str(event.get("message") or "").strip()
+        if message:
+            lines.append(f"  {_style(_truncate(message, 96), '2')}")
+    return "\n".join(lines)
+
+
 def _collector_summary(engine: ScanEngine) -> str:
     parts = []
     for name, entry in engine.collectors_dict().items():
@@ -231,7 +266,31 @@ def _summary(engine: ScanEngine, device_count: int, elapsed: float) -> str:
     collectors_line = _collector_summary(engine)
     if collectors_line:
         summary += f"\n{_style('sources', '2')} {collectors_line}"
+    diff_line = _diff_summary(engine.last_diff)
+    if diff_line:
+        summary += f"\n{_style('changes', '2')} {diff_line}"
     return summary
+
+
+def _diff_summary(diff: dict[str, Any] | None) -> str:
+    if not diff:
+        return ""
+    if diff.get("baseline"):
+        return "baseline recorded"
+    if diff.get("partial"):
+        return "scan was stopped; comparison skipped"
+    counts = diff.get("counts") or {}
+    parts = []
+    for key, label in (
+        ("new", "new"),
+        ("returned", "returned"),
+        ("offline", "offline"),
+        ("changed", "changed"),
+    ):
+        count = int(counts.get(key) or 0)
+        if count:
+            parts.append(f"{count} {label}")
+    return " · ".join(parts) if parts else "no changes"
 
 
 def _build_options(args: argparse.Namespace) -> ScanOptions:
@@ -349,6 +408,10 @@ def cmd_watch(args: argparse.Namespace) -> int:
 def cmd_devices(args: argparse.Namespace) -> int:
     store = _open_store(args)
     devices = store.devices_sorted()
+    trust = getattr(args, "trust", None)
+    if trust:
+        level = validate_trust(trust)
+        devices = [device for device in devices if device.trust == level]
     if args.json:
         print(json.dumps(store.snapshot(), indent=2, default=str))
         return 0
@@ -407,6 +470,81 @@ def cmd_history(args: argparse.Namespace) -> int:
     except (OSError, sqlite3.Error) as exc:
         print(f"lanwatch: cannot read scan history: {exc}", file=sys.stderr)
         return 1
+
+
+def cmd_events(args: argparse.Namespace) -> int:
+    store = _open_store(args)
+    history = HistoryStore(default_history_path(store.path))
+    limit = max(1, min(200, int(args.limit)))
+    severities = [item.strip().lower() for item in (args.severity or "").split(",") if item.strip()]
+    unknown = [value for value in severities if value not in SEVERITIES]
+    if unknown:
+        print(f"lanwatch: unknown severity {unknown[0]!r}", file=sys.stderr)
+        return 2
+    try:
+        device = normalize_ip(args.device) if args.device else None
+    except ValueError as exc:
+        print(f"lanwatch: {exc}", file=sys.stderr)
+        return 2
+    try:
+        events = history.event_log(
+            limit,
+            severities=severities,
+            event_type=args.type,
+            device=device,
+            unread=args.unread,
+        )
+        unread = history.unread_count()
+    except (OSError, sqlite3.Error) as exc:
+        print(f"lanwatch: cannot read event log: {exc}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "events": events,
+                    "unread": unread,
+                    "event_path": str(history.path),
+                },
+                indent=2,
+                default=str,
+            )
+        )
+        return 0
+    print(render_events(events))
+    print()
+    print(_style(f"{len(events)} event(s) · {unread} unread · log {history.path}", "2"))
+    return 0
+
+
+def cmd_trust(args: argparse.Namespace) -> int:
+    store = _open_store(args)
+    try:
+        address = normalize_ip(args.ip)
+        level = validate_trust(args.level)
+    except ValueError as exc:
+        print(f"lanwatch: {exc}", file=sys.stderr)
+        return 2
+    previous = store.devices.get(address)
+    before = previous.trust if previous is not None else None
+    try:
+        device = store.set_trust(address, level)
+    except ValueError as exc:
+        print(f"lanwatch: {exc}", file=sys.stderr)
+        return 2
+    if device is None:
+        print(f"lanwatch: no device with IP {address} in the inventory", file=sys.stderr)
+        return 1
+    store.save()
+    if before is not None and before != device.trust:
+        history = HistoryStore(default_history_path(store.path))
+        event = trust_event(device, before, store.active_id)
+        try:
+            history.record_event(event)
+        except (OSError, sqlite3.Error) as exc:
+            print(f"lanwatch: trust saved but event was not recorded: {exc}", file=sys.stderr)
+    print(f"{device.ip} is now {device.trust}")
+    return 0
 
 
 def cmd_web(args: argparse.Namespace) -> int:
@@ -500,6 +638,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  lanwatch watch -i 60          rescan every minute\n"
             "  lanwatch devices --all        list the saved inventory\n"
             "  lanwatch history              show recent scans\n"
+            "  lanwatch events               show recent network changes\n"
+            "  lanwatch trust 192.168.1.5 trusted  approve a device\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -516,6 +656,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     devices = subparsers.add_parser("devices", parents=[common], help="list the saved inventory")
     devices.add_argument("--online", action="store_true", help="only show online devices")
+    devices.add_argument("--trust", choices=("trusted", "unknown", "ignored"), help="filter by trust")
     devices.add_argument("--json", action="store_true", help="print JSON")
     devices.add_argument("--csv", action="store_true", help="print CSV")
     devices.add_argument("--verbose", "-v", action="store_true", help="show names, MACs and notes")
@@ -528,6 +669,17 @@ def build_parser() -> argparse.ArgumentParser:
     history_parser.add_argument("--device", metavar="IP", help="show history for one device")
     history_parser.add_argument("--json", action="store_true", help="print JSON")
     history_parser.set_defaults(func=cmd_history)
+
+    events_parser = subparsers.add_parser(
+        "events", parents=[common], help="show the persistent Event Center log"
+    )
+    events_parser.add_argument("--limit", type=int, default=30, help="rows to show (default 30)")
+    events_parser.add_argument("--severity", help="comma-separated severities")
+    events_parser.add_argument("--type", help="filter by event type")
+    events_parser.add_argument("--device", metavar="IP", help="filter by device IP")
+    events_parser.add_argument("--unread", action="store_true", help="only show unread events")
+    events_parser.add_argument("--json", action="store_true", help="print JSON")
+    events_parser.set_defaults(func=cmd_events)
 
     web_parser = subparsers.add_parser("web", parents=[common], help="serve the web dashboard")
     web_parser.add_argument("--host", default="127.0.0.1", help="bind address (default: loopback)")
@@ -557,6 +709,11 @@ def build_parser() -> argparse.ArgumentParser:
     forget.add_argument("ip")
     forget.set_defaults(func=cmd_forget)
 
+    trust = subparsers.add_parser("trust", parents=[common], help="set a device's trust level")
+    trust.add_argument("ip")
+    trust.add_argument("level", choices=("trusted", "unknown", "ignored"))
+    trust.set_defaults(func=cmd_trust)
+
     version = subparsers.add_parser("version", parents=[common], help="print the version")
     version.set_defaults(func=cmd_version)
     return parser
@@ -582,6 +739,9 @@ def _normalize_argv(argv: list[str]) -> list[str]:
         "--notes",
         "--limit",
         "--device",
+        "--severity",
+        "--type",
+        "--trust",
     }
     index = 0
     while index < len(argv):
