@@ -229,7 +229,9 @@ class NetworkApiTests(unittest.TestCase):
         self.store.upsert(Device(ip="192.168.1.1", online=True))
         self.store.activate("192.168.2.0/24")
         self.store.upsert(Device(ip="192.168.2.1", online=True))
-        self.engine = ScanEngine(self.store, ScanOptions())
+        # Keep the suite independent of the host's real Wi-Fi subnet.
+        with mock.patch("lanwatch.discovery.netif.detect_interfaces", return_value=[]):
+            self.engine = ScanEngine(self.store, ScanOptions())
         self.server = web.DashboardServer(("127.0.0.1", 0), self.engine)
         threading.Thread(
             target=self.server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True

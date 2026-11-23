@@ -10,6 +10,7 @@ Termux without extra packages.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import sqlite3
@@ -23,7 +24,7 @@ from .events import Event
 from .model import Device, normalize_ip
 from .store import default_state_path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 MAX_SCANS = 500
 MAX_LIMIT = 200
 MAX_EVENTS = 5000
@@ -57,6 +58,7 @@ CREATE TABLE IF NOT EXISTS scan_devices (
     hostname TEXT,
     mac TEXT,
     vendor TEXT,
+    kind TEXT,
     latency_ms REAL,
     ports TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (scan_id, ip)
@@ -72,16 +74,20 @@ CREATE TABLE IF NOT EXISTS events (
     type TEXT NOT NULL,
     severity TEXT NOT NULL,
     device_ip TEXT,
+    device_name TEXT,
     title TEXT NOT NULL,
     message TEXT NOT NULL DEFAULT '',
     details TEXT NOT NULL DEFAULT '{}',
-    read_at REAL
+    read_at REAL,
+    event_key TEXT
 );
 
 CREATE INDEX IF NOT EXISTS events_ts ON events(ts DESC);
 CREATE INDEX IF NOT EXISTS events_unread ON events(read_at, ts DESC);
 CREATE INDEX IF NOT EXISTS events_network ON events(network_id, ts DESC);
 CREATE INDEX IF NOT EXISTS events_device ON events(device_ip, ts DESC);
+CREATE INDEX IF NOT EXISTS events_type ON events(type, ts DESC);
+CREATE INDEX IF NOT EXISTS events_severity ON events(severity, ts DESC);
 """
 
 _EXTRA_SCAN_COLUMNS = {
@@ -91,6 +97,15 @@ _EXTRA_SCAN_COLUMNS = {
     "returned_devices": "INTEGER NOT NULL DEFAULT 0",
     "offline_devices": "INTEGER NOT NULL DEFAULT 0",
     "changed_devices": "INTEGER NOT NULL DEFAULT 0",
+}
+
+_EXTRA_SCAN_DEVICE_COLUMNS = {
+    "kind": "TEXT",
+}
+
+_EXTRA_EVENT_COLUMNS = {
+    "device_name": "TEXT",
+    "event_key": "TEXT",
 }
 
 
@@ -111,10 +126,12 @@ class HistoryStore:
         path: Path | str | None = None,
         max_scans: int = MAX_SCANS,
         max_events: int = MAX_EVENTS,
+        max_event_age_days: int = MAX_EVENT_AGE_DAYS,
     ) -> None:
         self.path = Path(path) if path else default_history_path()
         self.max_scans = max(1, int(max_scans))
         self.max_events = max(1, int(max_events))
+        self.max_event_age_days = max(1, int(max_event_age_days))
         self._schema_lock = threading.Lock()
         self._schema_ready = False
 
@@ -138,21 +155,33 @@ class HistoryStore:
             if self._schema_ready:
                 return
             connection.executescript(_SCHEMA)
-            columns = {
-                str(row["name"])
-                for row in connection.execute("PRAGMA table_info(scans)").fetchall()
-            }
-            for name, definition in _EXTRA_SCAN_COLUMNS.items():
-                if name not in columns:
-                    try:
-                        connection.execute(
-                            f"ALTER TABLE scans ADD COLUMN {name} {definition}"
-                        )
-                    except sqlite3.OperationalError as exc:
-                        # Another process may have migrated the same database
-                        # between our table_info() and ALTER.
-                        if "duplicate column" not in str(exc).lower():
-                            raise
+            _add_missing_columns(connection, "scans", _EXTRA_SCAN_COLUMNS)
+            _add_missing_columns(
+                connection, "scan_devices", _EXTRA_SCAN_DEVICE_COLUMNS
+            )
+            _add_missing_columns(connection, "events", _EXTRA_EVENT_COLUMNS)
+            connection.execute(
+                "UPDATE events SET severity = 'info' WHERE severity = 'notice'"
+            )
+            # Keyed scan events are idempotent.  Remove any pre-index duplicate
+            # keys before adding the unique index.
+            connection.execute(
+                """
+                DELETE FROM events
+                WHERE event_key IS NOT NULL
+                  AND id NOT IN (
+                      SELECT MIN(id) FROM events
+                      WHERE event_key IS NOT NULL
+                      GROUP BY event_key
+                  )
+                """
+            )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS events_event_key
+                ON events(event_key) WHERE event_key IS NOT NULL
+                """
+            )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS scans_network ON scans(network_id, id DESC)"
             )
@@ -191,6 +220,7 @@ class HistoryStore:
                 device.hostname or device.nbns_name,
                 device.mac,
                 device.vendor,
+                device.guess_kind(),
                 device.rtt_ms,
                 ",".join(str(port) for port in sorted(set(device.ports))),
             )
@@ -198,6 +228,14 @@ class HistoryStore:
         ]
         found = len(rows)
         event_list = list(events or [])
+        scan_stamp = (
+            network_id or "",
+            round(float(started_at), 6),
+            round(float(finished_at), 6),
+        )
+        for event in event_list:
+            if event.key is None:
+                event.key = _scan_event_key(scan_stamp, event)
         with self._connection() as connection, connection:
             cursor = connection.execute(
                 """
@@ -232,8 +270,9 @@ class HistoryStore:
                 connection.executemany(
                     """
                     INSERT INTO scan_devices (
-                        scan_id, ip, name, hostname, mac, vendor, latency_ms, ports
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        scan_id, ip, name, hostname, mac, vendor, kind,
+                        latency_ms, ports
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [(scan_id, *row) for row in rows],
                 )
@@ -257,10 +296,10 @@ class HistoryStore:
         actual_scan_id = event.scan_id if event.scan_id is not None else scan_id
         cursor = connection.execute(
             """
-            INSERT INTO events (
+            INSERT OR IGNORE INTO events (
                 ts, network_id, scan_id, type, severity, device_ip,
-                title, message, details, read_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                device_name, title, message, details, read_at, event_key
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 float(event.ts),
@@ -269,12 +308,24 @@ class HistoryStore:
                 event.type,
                 event.severity,
                 event.device_ip,
+                event.device_name,
                 event.title,
                 event.message,
                 json.dumps(event.details, default=str),
                 event.read_at,
+                event.key,
             ),
         )
+        if cursor.rowcount == 0 and event.key:
+            row = connection.execute(
+                "SELECT id, scan_id FROM events WHERE event_key = ?", (event.key,)
+            ).fetchone()
+            if row is not None:
+                event.id = int(row["id"])
+                event.scan_id = (
+                    int(row["scan_id"]) if row["scan_id"] is not None else actual_scan_id
+                )
+                return event.id
         event_id = int(cursor.lastrowid or 0)
         event.id = event_id
         event.scan_id = actual_scan_id
@@ -297,7 +348,7 @@ class HistoryStore:
             """,
             (self.max_events,),
         )
-        cutoff = time.time() - MAX_EVENT_AGE_DAYS * 86400
+        cutoff = time.time() - self.max_event_age_days * 86400
         connection.execute("DELETE FROM events WHERE ts < ?", (cutoff,))
 
     # -- readings --------------------------------------------------------
@@ -328,7 +379,7 @@ class HistoryStore:
             rows = connection.execute(
                 """
                 SELECT s.id AS scan_id, s.finished_at, s.subnet, s.network_id,
-                       d.name, d.hostname, d.mac, d.vendor, d.latency_ms, d.ports
+                       d.name, d.hostname, d.mac, d.vendor, d.kind, d.latency_ms, d.ports
                 FROM scan_devices AS d
                 JOIN scans AS s ON s.id = d.scan_id
                 WHERE d.ip = ?
@@ -362,7 +413,7 @@ class HistoryStore:
                 return None
             devices = connection.execute(
                 """
-                SELECT ip, name, hostname, mac, vendor, latency_ms, ports
+                SELECT ip, name, hostname, mac, vendor, kind, latency_ms, ports
                 FROM scan_devices
                 WHERE scan_id = ?
                 ORDER BY ip
@@ -409,7 +460,7 @@ class HistoryStore:
                 return None
             devices = connection.execute(
                 """
-                SELECT ip, name, hostname, mac, vendor, latency_ms, ports
+                SELECT ip, name, hostname, mac, vendor, kind, latency_ms, ports
                 FROM scan_devices
                 WHERE scan_id = ?
                 ORDER BY ip
@@ -497,7 +548,7 @@ class HistoryStore:
             rows = connection.execute(
                 f"""
                 SELECT id, ts, network_id, scan_id, type, severity, device_ip,
-                       title, message, details, read_at
+                       device_name, title, message, details, read_at
                 FROM events
                 {clause}
                 ORDER BY id DESC
@@ -556,6 +607,47 @@ class HistoryStore:
         with self._connection() as connection:
             row = connection.execute("SELECT COUNT(*) FROM events").fetchone()
         return int(row[0]) if row else 0
+
+
+def _scan_event_key(scan_stamp: tuple[str, float, float], event: Event) -> str:
+    """Stable key for idempotent scan-event insertion.
+
+    A scan is identified by its network and start/finish timestamps.  If the
+    same completed scan is handed to the recorder twice, all event keys match
+    and the unique index keeps the log unchanged.
+    """
+    payload = json.dumps(
+        {
+            "scan": scan_stamp,
+            "type": event.type,
+            "device_ip": event.device_ip,
+            "device_name": event.device_name,
+            "title": event.title,
+            "message": event.message,
+            "details": event.details,
+        },
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _add_missing_columns(
+    connection: sqlite3.Connection, table: str, definitions: dict[str, str]
+) -> None:
+    """Apply additive schema migrations, tolerating a concurrent migrator."""
+    columns = {
+        str(row["name"])
+        for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    for name, definition in definitions.items():
+        if name in columns:
+            continue
+        try:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column" not in str(exc).lower():
+                raise
 
 
 def _clamp_limit(limit: int, default: int) -> int:

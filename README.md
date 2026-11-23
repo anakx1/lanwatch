@@ -117,13 +117,19 @@ MAC (same CIDR with a different gateway MAC is a different network).
 
 - Live device table over Server-Sent Events (`/api/events`) — no polling.
 - Collector status chips: see at a glance what worked on this network.
-- Filters (offline visibility, trust level), sorting, and search.
+- Filters (offline visibility, trust level: all/trusted/unknown/ignored),
+  sorting, and search.
 - Network switcher with per-network inventories (see [Networks](#networks)).
 - Device kind icons, confidence, and the evidence behind each guess.
 - Device drawer: rename, set trust, add notes, run an on-demand port probe,
   forget.
-- Scan comparison banner: new, returned, offline and changed devices.
-- Event Center: durable, filterable history of changes with unread counts.
+- Scan comparison summary: new, returned, offline, ports opened/closed, and
+  device-information changes, with empty categories omitted.
+- Event Center: a live dashboard panel and a full dialog with severity and
+  device filters, unread counts, click-to-device, and empty/loading/error
+  states.
+- New-device toast plus a temporary `new` row badge, cleared when the device
+  drawer is opened.
 - Scan settings dialog: subnet, ports, timeout, concurrency, deep mode,
   per-collector toggles — applied to the next scan.
 - Scan history: a live trend bar chart and recent-scan table backed by SQLite.
@@ -237,8 +243,9 @@ lanwatch history --json
 
 The `scans` table stores the network, start/finish times, duration, host and
 device counts, a stopped/error flag, and the comparison counts. `scan_devices`
-stores the snapshot of each device seen in that scan, so per-device presence
-and services are available even after the device disappears from the inventory.
+stores the snapshot of each device seen in that scan, including its detected
+type and the ports observed by that scan, so per-device presence and service
+changes remain available even after the device disappears from the inventory.
 History is shared across networks — each row records its scanned network and
 subnet — and is capped at the newest 500 scans to keep the database small.
 SQLite is part of the Python standard library, so this adds no dependency.
@@ -247,14 +254,16 @@ SQLite is part of the Python standard library, so this adds no dependency.
 
 Trust is user-assigned and stored with the device in its network inventory:
 
-- **trusted** — expected gear; offline and service changes are warnings.
-- **unknown** — the default. Changes are recorded, but with a lower severity.
-- **ignored** — still scanned and kept in the inventory, but hidden from the
-  default device list and excluded from change events and alerts.
+- **trusted** — expected gear; scan-diff summaries treat an offline change as
+  a warning.
+- **unknown** — the default. Changes are recorded at their normal severity.
+- **ignored** — still scanned and kept in the inventory, but excluded from
+  change events and alerts. The dashboard's **All** trust filter includes
+  ignored devices; choose **Ignored** to isolate them.
 
 Set it in the device drawer or with `lanwatch trust IP trusted|unknown|ignored`.
-Collectors never overwrite trust, and the dashboard's trust filter can show
-ignored devices when you need them.
+Collectors never overwrite trust, and the drawer and device rows show the
+current trust state.
 
 After every completed scan, `lanwatch` compares the snapshot with the previous
 completed scan on the same network. The first completed scan is a **baseline**
@@ -266,7 +275,13 @@ record:
 - devices that went offline;
 - the same IP with a different MAC (possible replacement);
 - the same MAC on a new IP (DHCP move);
-- hostname and open-service changes.
+- hostname, vendor, detected device-type, and open/closed port changes.
+
+Ports are compared against the ports actually observed by the scan rather than
+the inventory's historical union, so a service that closes is reported. Only
+ports within the scan's port-check scope are treated as closed; unchecked
+ports are left alone. Snapshots keep the scan history independent of the
+mutable live inventory.
 
 Stopped scans are recorded but never used as a comparison baseline. Failed
 scans do not create a history row; they add a `scan.failed` event instead.
@@ -275,9 +290,13 @@ Comparison logic lives in `lanwatch/changes.py` and does no I/O.
 ## Event Center
 
 Durable events share the history database (`events` table) and survive browser
-reloads and process restarts. The dashboard bell shows unread counts; the Event
-Center can filter by severity and unread state, open the related device, and
-mark events read. Events can also be read from the CLI and API:
+reloads and process restarts. They are built from the same Phase 2 comparison
+result as `scan.diff`; there is no separate change-detection engine. The
+dashboard shows the newest events in an Event Center panel; the bell opens the
+full dialog. Both share severity (all/info/warning/critical), device, and unread
+filters. Clicking a device-related event opens that device's drawer, while scan
+events remain non-interactive. Filters are applied through the API without a
+page reload. Events can also be read from the CLI and API:
 
 ```bash
 lanwatch events
@@ -285,8 +304,43 @@ lanwatch events --severity warning,critical --unread
 lanwatch events --device 192.168.1.24 --json
 ```
 
-Events are capped at the newest 5,000 and pruned after 180 days. `scan.failed`
-events are recorded without a scan row and are not used for comparison.
+Important categories are:
+
+- `device.new`, `device.online`, `device.offline`
+- `device.hostname_changed`, `device.vendor_changed`, `device.kind_changed`
+- `port.opened`, `port.closed`
+- `scan.completed`, `scan.failed`
+
+The comparison's extra identity signals are retained as `device.ip_changed`
+and `device.replaced`; trust changes remain `device.trust_changed`. A single
+combined comparison change can produce several specific events, such as a
+hostname event and a port event.
+
+Every event has a unique id, timestamp, network id, type, severity, short
+title, human-readable description, relevant before/after details, and either a
+device IP/name or a related scan id. Severity is centralized in
+`lanwatch/events.py`:
+
+| Severity | Events | Meaning |
+| --- | --- | --- |
+| `info` | online, hostname/vendor/type changes, port changes, scan completed, IP change, trust change | Routine activity |
+| `warning` | new device, offline device, scan failed | Noteworthy, but not proof of a security problem |
+| `critical` | same-IP MAC replacement | Identity conflict that may indicate spoofing |
+
+A newly discovered device is deliberately a warning, not a critical or
+automatic malicious finding.
+
+Scan events are keyed by network, scan timestamps, type, device, and change
+details. Reprocessing the same scan is idempotent: the unique event key keeps
+the log unchanged. SQLite uses short-lived connections with a busy timeout,
+plus indexes on timestamp, network, type, severity, device IP, and unread
+state. Completed scans publish each new event as an SSE `event.new` message
+without disrupting the existing snapshot/device/scan events.
+
+Storage is bounded to the newest 5,000 events and pruned after 180 days.
+`HistoryStore` exposes `max_events` and `max_event_age_days` for deployments
+that need different limits. `scan.failed` events are recorded without a scan
+row and are not used for comparison.
 
 ## Running on Android / Termux
 
@@ -317,7 +371,7 @@ On a normal Linux machine all collectors usually work, with or without root.
 ## Tests and development
 
 ```bash
-python3 -m unittest discover -s tests -t .   # 165 tests
+python3 -m unittest discover -s tests -t .   # 201 tests
 ruff check .
 mypy
 ```

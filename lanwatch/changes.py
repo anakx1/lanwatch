@@ -55,6 +55,7 @@ class SnapshotDevice:
     hostname: str | None = None
     mac: str | None = None
     vendor: str | None = None
+    kind: str | None = None
     ports: tuple[int, ...] = ()
     trust: str = DEFAULT_TRUST
 
@@ -66,6 +67,7 @@ class SnapshotDevice:
             hostname=_clean(device.hostname or device.nbns_name),
             mac=oui.normalize_mac(device.mac),
             vendor=_clean(device.vendor),
+            kind=_clean(device.guess_kind()),
             ports=tuple(sorted(set(device.ports))),
             trust=device.trust,
         )
@@ -78,6 +80,7 @@ class SnapshotDevice:
             hostname=_clean(raw.get("hostname")),
             mac=oui.normalize_mac(_clean(raw.get("mac"))),
             vendor=_clean(raw.get("vendor")),
+            kind=_clean(raw.get("kind")),
             ports=_ports(raw.get("ports")),
             trust=str(raw.get("trust") or DEFAULT_TRUST),
         )
@@ -89,6 +92,7 @@ class SnapshotDevice:
             "hostname": self.hostname,
             "mac": self.mac,
             "vendor": self.vendor,
+            "kind": self.kind,
             "ports": list(self.ports),
             "trust": self.trust,
         }
@@ -162,18 +166,57 @@ def _ignored(snapshot: SnapshotDevice, trust_by_ip: Mapping[str, str] | None) ->
     return bool(trust_by_ip and trust_by_ip.get(snapshot.ip) == "ignored")
 
 
+def _text_key(value: object) -> str:
+    return str(value or "").strip().casefold()
+
+
+def _device_summary(device: SnapshotDevice) -> str:
+    """Compact identity line for new/returned device events."""
+    parts = [device.ip]
+    for value in (device.hostname, device.vendor, device.kind):
+        if value and value != "device" and value not in parts:
+            parts.append(value)
+    return " · ".join(parts)
+
+
+def _port_summary(ports: list[int], action: str) -> str:
+    label = "Port" if len(ports) == 1 else "Ports"
+    return f"{label} {', '.join(str(port) for port in ports)} {action}"
+
+
 def _changed_fields(
     previous: SnapshotDevice, current: SnapshotDevice
 ) -> DeviceChange | None:
     added = sorted(set(current.ports) - set(previous.ports))
     removed = sorted(set(previous.ports) - set(current.ports))
-    hostname_changed = (previous.hostname or "").lower() != (current.hostname or "").lower()
-    if not added and not removed and not hostname_changed:
+    hostname_changed = _text_key(previous.hostname) != _text_key(current.hostname)
+    vendor_changed = _text_key(previous.vendor) != _text_key(current.vendor)
+    # Older history rows have no type column.  Do not report every device as
+    # "changed" just because it was recorded before type snapshots existed.
+    kind_changed = bool(
+        _text_key(previous.kind)
+        and _text_key(current.kind)
+        and _text_key(previous.kind) != _text_key(current.kind)
+    )
+    if not added and not removed and not hostname_changed and not vendor_changed and not kind_changed:
         return None
+
+    fields = []
+    if hostname_changed:
+        fields.append("hostname")
+    if vendor_changed:
+        fields.append("vendor")
+    if kind_changed:
+        fields.append("type")
+    if added:
+        fields.append("ports_added")
+    if removed:
+        fields.append("ports_removed")
 
     details: dict[str, Any] = {
         "before": previous.to_dict(),
         "after": current.to_dict(),
+        "fields": fields,
     }
     if added:
         details["ports_added"] = added
@@ -182,37 +225,58 @@ def _changed_fields(
     if hostname_changed:
         details["hostname_before"] = previous.hostname
         details["hostname_after"] = current.hostname
+    if vendor_changed:
+        details["vendor_before"] = previous.vendor
+        details["vendor_after"] = current.vendor
+    if kind_changed:
+        details["kind_before"] = previous.kind
+        details["kind_after"] = current.kind
+
+    bits = []
+    if hostname_changed:
+        bits.append(f"hostname {previous.hostname or 'unknown'} → {current.hostname or 'unknown'}")
+    if vendor_changed:
+        if previous.vendor and current.vendor:
+            bits.append(f"vendor {previous.vendor} → {current.vendor}")
+        elif current.vendor:
+            bits.append(f"vendor became {current.vendor}")
+        else:
+            bits.append(f"vendor no longer reported ({previous.vendor})")
+    if kind_changed:
+        bits.append(f"type {previous.kind} → {current.kind}")
+    if added:
+        bits.append(_port_summary(added, "opened"))
+    if removed:
+        bits.append(_port_summary(removed, "closed"))
 
     if added or removed:
         event_type = "device.services_changed"
+        title = f"Services changed on {current.name}"
         if added and current.trust != "trusted":
             severity = WARNING
         elif added:
             severity = NOTICE
         else:
             severity = INFO
-        bits = []
-        if added:
-            bits.append("opened " + ", ".join(str(port) for port in added))
-        if removed:
-            bits.append("closed " + ", ".join(str(port) for port in removed))
-        if hostname_changed:
-            bits.append("hostname changed")
-        return DeviceChange(
-            event_type=event_type,
-            severity=severity,
-            ip=current.ip,
-            title=f"Services changed on {current.name}",
-            message=" · ".join(bits),
-            details=details,
-        )
+    elif hostname_changed:
+        event_type = "device.hostname_changed"
+        title = f"Hostname changed on {current.name}"
+        severity = INFO
+    elif vendor_changed:
+        event_type = "device.vendor_changed"
+        title = f"Vendor changed on {current.name}"
+        severity = INFO
+    else:
+        event_type = "device.fingerprint_changed"
+        title = f"Device type changed on {current.name}"
+        severity = INFO
 
     return DeviceChange(
-        event_type="device.hostname_changed",
-        severity=INFO,
+        event_type=event_type,
+        severity=severity,
         ip=current.ip,
-        title=f"Hostname changed on {current.name}",
-        message=f"{previous.hostname or 'unknown'} → {current.hostname or 'unknown'}",
+        title=title,
+        message=" · ".join(bits),
         details=details,
     )
 
@@ -340,7 +404,7 @@ def compare_snapshots(
                     severity=NOTICE,
                     ip=current_item.ip,
                     title=f"Known device returned: {current_item.name}",
-                    message=current_item.ip,
+                    message=_device_summary(current_item),
                     details={"device": current_item.to_dict()},
                 )
             )
@@ -353,7 +417,7 @@ def compare_snapshots(
                     severity=WARNING,
                     ip=current_item.ip,
                     title=f"New device: {current_item.name}",
-                    message=current_item.ip,
+                    message=_device_summary(current_item),
                     details={"device": current_item.to_dict()},
                 )
             )

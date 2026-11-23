@@ -225,7 +225,7 @@ def render_events(events: list[dict[str, Any]]) -> str:
     for event in events:
         when = _history_time(event.get("ts"))
         severity = str(event.get("severity") or "info")
-        color = {"info": "2", "notice": "36", "warning": "33", "critical": "31"}.get(
+        color = {"info": "2", "warning": "33", "critical": "31"}.get(
             severity, "2"
         )
         marker = "*" if not event.get("read") else " "

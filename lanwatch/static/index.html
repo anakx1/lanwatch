@@ -115,6 +115,37 @@
         <div class="collectors" id="collectors" aria-label="Discovery sources"></div>
       </section>
 
+      <section class="events-panel" id="events-panel" aria-labelledby="events-panel-title">
+        <div class="events-panel-head">
+          <div>
+            <h2 id="events-panel-title">Event center</h2>
+            <p id="events-panel-sub">Recent network activity</p>
+          </div>
+          <div class="events-panel-actions">
+            <button class="btn ghost icon-only" id="events-refresh" type="button" aria-label="Refresh events" title="Refresh events">
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M20 7v5h-5"/><path d="M4 17v-5h5"/><path d="M6.1 9a7 7 0 0 1 11.7-2L20 9M4 15l2.2 2a7 7 0 0 0 11.7-2"/>
+              </svg>
+            </button>
+            <button class="btn ghost small" id="events-view-all" type="button">View all</button>
+          </div>
+        </div>
+        <div class="event-filters">
+          <div class="severity-chips" id="event-severity-chips" role="group" aria-label="Filter by severity">
+            <button type="button" class="filter-chip" data-severity="all" aria-pressed="true">All</button>
+            <button type="button" class="filter-chip" data-severity="info" aria-pressed="false">Info</button>
+            <button type="button" class="filter-chip" data-severity="warning" aria-pressed="false">Warning</button>
+            <button type="button" class="filter-chip" data-severity="critical" aria-pressed="false">Critical</button>
+          </div>
+          <select id="event-device-filter" aria-label="Filter events by device">
+            <option value="">All devices</option>
+          </select>
+        </div>
+        <ul class="event-list event-list-panel" id="events-panel-list"></ul>
+        <div class="event-status" id="events-panel-status" hidden></div>
+        <p class="event-panel-hint" id="events-panel-hint"></p>
+      </section>
+
       <section class="devices">
         <div class="toolbar">
           <div class="search">
@@ -127,7 +158,7 @@
           <div class="toolbar-right">
             <label class="check"><input type="checkbox" id="show-offline" checked><span>Offline</span></label>
             <select id="trust-filter" aria-label="Filter by trust">
-              <option value="all">Trust · all</option>
+              <option value="all">All trust</option>
               <option value="trusted">Trusted</option>
               <option value="unknown">Unknown</option>
               <option value="ignored">Ignored</option>
@@ -282,18 +313,20 @@
     <div class="dialog-body event-body">
       <div class="event-toolbar">
         <select id="event-severity" aria-label="Filter events by severity">
-          <option value="all">All severities</option>
-          <option value="warning">Warning and above</option>
+          <option value="all">All events</option>
           <option value="info">Info</option>
-          <option value="notice">Notice</option>
-          <option value="warning-only">Warnings</option>
+          <option value="warning">Warning</option>
           <option value="critical">Critical</option>
         </select>
+        <select id="event-device-filter-modal" aria-label="Filter events by device">
+          <option value="">All devices</option>
+        </select>
         <label class="check"><input type="checkbox" id="event-unread"><span>Unread</span></label>
+        <button class="btn ghost small" type="button" id="events-refresh-modal" aria-label="Refresh events" title="Refresh events">Refresh</button>
         <button class="btn ghost small" type="button" id="events-mark-read">Mark all read</button>
       </div>
-      <div class="event-list" id="event-list"></div>
-      <p class="event-empty" id="event-empty">No events yet. Scan twice to see changes between scans.</p>
+      <ul class="event-list" id="event-list"></ul>
+      <div class="event-status" id="event-status" hidden></div>
       <p class="dialog-note" id="event-hint"></p>
     </div>
     <div class="dialog-actions">

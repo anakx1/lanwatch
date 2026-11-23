@@ -11,7 +11,7 @@ import re
 import sqlite3
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from . import __version__, collectors, netif, oui
@@ -547,6 +547,8 @@ class ScanEngine:
     def _run(self, options: ScanOptions, scan_id: int) -> None:
         started = time.monotonic()
         seen: set[str] = set()
+        port_scopes: dict[str, set[int]] = {}
+        port_open: dict[str, set[int]] = {}
         error: str | None = None
         passive: dict[str, Any] = {}
         threads: list[threading.Thread] = []
@@ -668,6 +670,9 @@ class ScanEngine:
                     found = collectors.scan_ports(
                         silent, DEEP_PORTS, timeout=0.25, workers=128, cancel=self._cancel
                     )
+                    for ip in silent:
+                        port_scopes.setdefault(ip, set()).update(DEEP_PORTS)
+                        port_open.setdefault(ip, set()).update(found.get(ip, []))
                     for ip, ports in sorted(found.items()):
                         self._record(
                             Device(ip=ip, ports=ports, sources=["tcp"], online=True), seen
@@ -687,6 +692,9 @@ class ScanEngine:
                     workers=128,
                     cancel=self._cancel,
                 )
+                for ip in alive:
+                    port_scopes.setdefault(ip, set()).update(options.ports)
+                    port_open.setdefault(ip, set()).update(open_map.get(ip, []))
                 banners = _collect_banners(open_map)
                 for ip, ports in sorted(open_map.items()):
                     self._record(
@@ -813,7 +821,13 @@ class ScanEngine:
             for device in self.store.mark_offline(seen, cidr):
                 self._emit("device", device=device.to_dict())
 
-            self._finish(scan_id, seen, started)
+            self._finish(
+                scan_id,
+                seen,
+                started,
+                port_scopes=port_scopes,
+                port_open=port_open,
+            )
         except (netif.InterfaceError, netif.SubnetTooLarge, ValueError) as exc:
             error = str(exc)
         except Exception as exc:  # pragma: no cover - last-resort guard
@@ -1000,6 +1014,8 @@ class ScanEngine:
         seen: set[str],
         started: float,
         stopped: bool = False,
+        port_scopes: dict[str, set[int]] | None = None,
+        port_open: dict[str, set[int]] | None = None,
     ) -> None:
         duration = round(time.monotonic() - started, 2)
         with self._lock:
@@ -1017,17 +1033,31 @@ class ScanEngine:
         # Publish and persist before clearing "running": observers that wait
         # for the scan to stop must not race the final write.
         self.store.save()
-        self._record_history(state, seen, stopped)
+        self._record_history(
+            state,
+            seen,
+            stopped,
+            port_scopes=port_scopes,
+            port_open=port_open,
+        )
         self._emit("scan.finished", state=state, counts=self.store.counts(), stopped=stopped)
         self._set_state(running=False)
 
     def _record_history(
-        self, state: dict[str, Any], seen: set[str], stopped: bool
+        self,
+        state: dict[str, Any],
+        seen: set[str],
+        stopped: bool,
+        *,
+        port_scopes: dict[str, set[int]] | None = None,
+        port_open: dict[str, set[int]] | None = None,
     ) -> None:
         """Write a completed scan, its diff and events without failing the scan."""
         network = self.store.network or {}
         network_id = network.get("network_id") or self.store.active_id
         subnet = network.get("cidr") or state.get("subnet")
+        scopes = port_scopes or {}
+        opened = port_open or {}
         with self.store.lock:
             devices = [
                 self.store.devices[ip]
@@ -1037,6 +1067,21 @@ class ScanEngine:
             trust_map = {
                 device.ip: device.trust for device in self.store.devices.values()
             }
+            snapshots: list[SnapshotDevice] = []
+            history_devices: list[Device] = []
+            for device in devices:
+                ports: set[int] | None = None
+                if device.ip in scopes or device.ip in opened:
+                    ports = set(device.ports)
+                    ports.difference_update(scopes.get(device.ip, set()))
+                    ports.update(opened.get(device.ip, set()))
+                scan_device = (
+                    replace(device, ports=sorted(ports))
+                    if ports is not None
+                    else device
+                )
+                snapshots.append(SnapshotDevice.from_device(scan_device))
+                history_devices.append(scan_device)
         try:
             diff: ScanDiff | None = None
             previous: dict[str, Any] | None = None
@@ -1055,7 +1100,7 @@ class ScanEngine:
 
                 diff = compare_snapshots(
                     previous.get("devices") if previous is not None else None,
-                    [SnapshotDevice.from_device(device) for device in devices],
+                    snapshots,
                     previous_scan_id=(
                         int(previous["id"]) if previous is not None else None
                     ),
@@ -1065,7 +1110,7 @@ class ScanEngine:
                 )
             events = events_for_diff(diff, network_id) if diff is not None else []
             scan_row_id = self.history.record_scan(
-                devices,
+                history_devices,
                 started_at=float(state.get("started_at") or time.time()),
                 finished_at=float(state.get("finished_at") or time.time()),
                 duration_s=state.get("duration_s"),
@@ -1083,6 +1128,8 @@ class ScanEngine:
                 events=events,
             )
             self.history_error = None
+            for event in events:
+                self._emit("event.new", event=event.to_dict())
             if diff is not None:
                 payload = diff.to_dict()
                 payload.update(

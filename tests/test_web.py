@@ -153,11 +153,22 @@ class WebTests(unittest.TestCase):
         status, _, body = self.request(
             "/api/device",
             "POST",
+            {"ip": "10.0.0.1", "label": "Router", "notes": "keep me"},
+            HEADERS,
+        )
+        self.assertEqual(status, 200, body)
+
+        status, _, body = self.request(
+            "/api/device",
+            "POST",
             {"ip": "10.0.0.1", "trust": "trusted"},
             HEADERS,
         )
         self.assertEqual(status, 200, body)
-        self.assertEqual(json.loads(body)["device"]["trust"], "trusted")
+        updated = json.loads(body)["device"]
+        self.assertEqual(updated["trust"], "trusted")
+        self.assertEqual(updated["label"], "Router")
+        self.assertEqual(updated["notes"], "keep me")
 
         status, _, _ = self.request(
             "/api/device",
@@ -200,6 +211,57 @@ class WebTests(unittest.TestCase):
         self.assertEqual(status, 200, body)
         self.assertEqual(json.loads(body)["unread"], 0)
 
+    def test_event_log_filters_and_scan_completion(self) -> None:
+        self.start_scan()
+        state = self.state()
+        network_id = state["latest_diff"]["network_id"]
+
+        status, _, body = self.request("/api/event-log?type=scan.completed&limit=5")
+        self.assertEqual(status, 200, body)
+        log = json.loads(body)
+        self.assertEqual(len(log["events"]), 1)
+        completed = log["events"][0]
+        self.assertEqual(completed["type"], "scan.completed")
+        self.assertEqual(completed["severity"], "info")
+        self.assertEqual(completed["network_id"], network_id)
+        self.assertEqual(completed["description"], completed["message"])
+        self.assertIsNone(completed["device_ip"])
+        self.assertGreater(completed["ts"], 0)
+
+        for query in (
+            f"type=scan.completed&network_id={network_id}",
+            "type=scan.completed&severity=info",
+            "type=scan.completed&limit=1",
+            f"before_id={completed['id'] + 1}",
+        ):
+            status, _, body = self.request(f"/api/event-log?{query}")
+            self.assertEqual(status, 200, f"{query}: {body}")
+            self.assertIn("scan.completed", {e["type"] for e in json.loads(body)["events"]})
+
+        status, _, body = self.request(
+            "/api/device",
+            "POST",
+            {"ip": "10.0.0.1", "trust": "trusted"},
+            HEADERS,
+        )
+        self.assertEqual(status, 200, body)
+        status, _, body = self.request(
+            "/api/event-log?type=device.trust_changed&severity=info"
+            "&device=10.0.0.1&limit=1"
+        )
+        self.assertEqual(status, 200, body)
+        events = json.loads(body)["events"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["device_name"], "ROUTER")
+        self.assertEqual(events[0]["details"]["after"], "trusted")
+        status, _, body = self.request(
+            "/api/event-log?type=device.trust_changed&device=10.0.0.2"
+        )
+        self.assertEqual(json.loads(body)["events"], [])
+
+        status, _, body = self.request("/api/event-log?before_id=0")
+        self.assertEqual(status, 400, body)
+
     def test_history_endpoint_reports_read_errors(self) -> None:
         self.engine.history.recent = unittest.mock.Mock(side_effect=OSError("read-only"))
         status, _, body = self.request("/api/history")
@@ -219,6 +281,50 @@ class WebTests(unittest.TestCase):
         self.assertIn('id="events-btn"', text)
         self.assertIn('id="drawer-trust"', text)
         self.assertIn('id="trust-filter"', text)
+
+    def test_dashboard_event_and_trust_controls(self) -> None:
+        status, _, body = self.request("/")
+        self.assertEqual(status, 200)
+        text = body.decode()
+        for element in (
+            'id="events-panel"',
+            'id="events-panel-list"',
+            'id="events-panel-status"',
+            'id="events-refresh"',
+            'id="event-device-filter"',
+            'id="event-status"',
+            'id="events-refresh-modal"',
+        ):
+            self.assertIn(element, text)
+        for severity in ("all", "info", "warning", "critical"):
+            self.assertIn(f'data-severity="{severity}"', text)
+        for trust in ("all", "trusted", "unknown", "ignored"):
+            self.assertIn(f'<option value="{trust}"', text)
+        self.assertNotIn('value="notice"', text)
+        self.assertNotIn("warning-only", text)
+
+        status, _, body = self.request("/static/app.js")
+        self.assertEqual(status, 200)
+        script = body.decode()
+        for event_type in (
+            "device.new",
+            "device.online",
+            "device.offline",
+            "device.hostname_changed",
+            "device.vendor_changed",
+            "device.kind_changed",
+            "port.opened",
+            "port.closed",
+            "scan.completed",
+            "scan.failed",
+            "device.ip_changed",
+            "device.replaced",
+            "device.trust_changed",
+        ):
+            self.assertIn(f"'{event_type}'", script)
+        self.assertIn("function eventStatusHtml", script)
+        self.assertIn("data-act=\"refresh-events\"", script)
+        self.assertIn("state.newDevices.delete(ip)", script)
 
     def test_mutations_require_header_and_matching_origin(self) -> None:
         status, _, _ = self.request("/api/scan", "POST", {})
@@ -302,6 +408,37 @@ class WebTests(unittest.TestCase):
             self.assertEqual(event["type"], "hello")
             self.assertIn("state", event)
             self.assertIn("unread", event)
+        finally:
+            connection.close()
+
+    def test_sse_publishes_scan_event_new(self) -> None:
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", self.server.server_address[1], timeout=10
+        )
+        try:
+            connection.request("GET", "/api/events")
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            hello = response.readline().decode("utf-8")
+            self.assertTrue(hello.startswith("data: "), hello)
+            self.assertEqual(response.readline().decode("utf-8"), "\n")
+
+            self.start_scan()
+            published = []
+            for _ in range(400):
+                line = response.readline().decode("utf-8")
+                if not line.startswith("data: "):
+                    continue
+                message = json.loads(line[len("data: ") :])
+                if message["type"] == "event.new":
+                    published.append(message["event"])
+                if any(item["type"] == "scan.completed" for item in published):
+                    break
+            completed = next(
+                item for item in published if item["type"] == "scan.completed"
+            )
+            self.assertGreater(completed["id"], 0)
+            self.assertEqual(completed["network_id"], "10.0.0.0/24")
         finally:
             connection.close()
 
