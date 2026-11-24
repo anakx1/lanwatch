@@ -234,16 +234,19 @@ def _changed_fields(
 
     bits = []
     if hostname_changed:
-        bits.append(f"hostname {previous.hostname or 'unknown'} → {current.hostname or 'unknown'}")
+        bits.append(
+            f"hostname changed from {previous.hostname or 'not reported'} "
+            f"to {current.hostname or 'not reported'}"
+        )
     if vendor_changed:
         if previous.vendor and current.vendor:
-            bits.append(f"vendor {previous.vendor} → {current.vendor}")
+            bits.append(f"vendor changed: {previous.vendor} → {current.vendor}")
         elif current.vendor:
             bits.append(f"vendor became {current.vendor}")
         else:
-            bits.append(f"vendor no longer reported ({previous.vendor})")
+            bits.append(f"vendor no longer reported (was {previous.vendor})")
     if kind_changed:
-        bits.append(f"type {previous.kind} → {current.kind}")
+        bits.append(f"device type changed from {previous.kind} to {current.kind}")
     if added:
         bits.append(_port_summary(added, "opened"))
     if removed:
@@ -345,8 +348,10 @@ def compare_snapshots(
                             ip=current_item.ip,
                             title=f"Device identity changed at {current_item.ip}",
                             message=(
-                                f"MAC changed from {previous_item.mac} "
-                                f"to {current_item.mac}"
+                                f"The MAC address at this address changed from "
+                                f"{previous_item.mac} to {current_item.mac}. "
+                                "A device may have been replaced, or another device "
+                                "may be using the same IP address."
                             ),
                             details={
                                 "before": previous_item.to_dict(),
@@ -376,7 +381,11 @@ def compare_snapshots(
                             severity=NOTICE,
                             ip=current_item.ip,
                             title=f"{current_item.name} changed address",
-                            message=f"{previous_item.ip} → {current_item.ip}",
+                            message=(
+                                f"Address changed from {previous_item.ip} to "
+                                f"{current_item.ip}. The same MAC address was seen "
+                                "at both addresses, so this is probably the same device."
+                            ),
                             details={
                                 "before": previous_item.to_dict(),
                                 "after": current_item.to_dict(),
@@ -403,8 +412,8 @@ def compare_snapshots(
                     event_type="device.returned",
                     severity=NOTICE,
                     ip=current_item.ip,
-                    title=f"Known device returned: {current_item.name}",
-                    message=_device_summary(current_item),
+                    title=f"Device back online: {current_item.name}",
+                    message=f"Back online after missing a scan: {_device_summary(current_item)}",
                     details={"device": current_item.to_dict()},
                 )
             )
@@ -417,7 +426,7 @@ def compare_snapshots(
                     severity=WARNING,
                     ip=current_item.ip,
                     title=f"New device: {current_item.name}",
-                    message=_device_summary(current_item),
+                    message=f"New on this network: {_device_summary(current_item)}",
                     details={"device": current_item.to_dict()},
                 )
             )
@@ -445,7 +454,7 @@ def compare_snapshots(
                 severity=severity,
                 ip=previous_item.ip,
                 title=f"Device offline: {previous_item.name}",
-                message=previous_item.ip,
+                message=f"No longer answering: {_device_summary(previous_item)}",
                 details={"device": previous_item.to_dict()},
             )
         )

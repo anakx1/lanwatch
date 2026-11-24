@@ -38,6 +38,7 @@ HISTORY_DEFAULT = 12
 HISTORY_MAX = 200
 EVENT_DEFAULT = 50
 EVENT_MAX = 200
+SQLITE_MAX_INT = 2**63 - 1
 
 _MIME = {
     ".html": "text/html; charset=utf-8",
@@ -93,6 +94,8 @@ def _positive_int(raw: str, name: str) -> int | None:
         raise ValueError(f"{name} must be an integer") from exc
     if value < 1:
         raise ValueError(f"{name} must be positive")
+    if value > SQLITE_MAX_INT:
+        raise ValueError(f"{name} is too large")
     return value
 
 
@@ -271,6 +274,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         try:
             size = int(length)
         except ValueError:
+            self._send_error_json(400, "invalid Content-Length")
+            return None
+        if size < 0:
             self._send_error_json(400, "invalid Content-Length")
             return None
         if size > MAX_BODY:
@@ -457,6 +463,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "has_more": len(events) >= limit,
                 "path": str(self.engine.history.path),
                 "error": self.engine.event_error or self.engine.history_error,
+                "retention": {
+                    "max_events": self.engine.history.max_events,
+                    "max_event_age_days": self.engine.history.max_event_age_days,
+                },
             }
         )
 
@@ -472,6 +482,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 ids = [int(value) for value in ids]
             except (TypeError, ValueError) as exc:
                 raise ValueError("ids must contain integers") from exc
+            if any(value < 1 or value > SQLITE_MAX_INT for value in ids):
+                raise ValueError("ids must be positive 64-bit integers")
         if all_events and ids:
             raise ValueError("use either ids or all, not both")
         network_id = payload.get("network_id")
@@ -549,8 +561,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 )
             except (OSError, sqlite3.Error):
                 hello["unread"] = 0
-            if self.engine.last_diff is not None:
-                hello["latest_diff"] = self.engine.last_diff
+            latest_diff = self.engine.latest_diff_for_active()
+            if latest_diff is not None:
+                hello["latest_diff"] = latest_diff
             self._write_event(hello)
             while True:
                 try:

@@ -122,18 +122,22 @@ MAC (same CIDR with a different gateway MAC is a different network).
 - Network switcher with per-network inventories (see [Networks](#networks)).
 - Device kind icons, confidence, and the evidence behind each guess.
 - Device drawer: rename, set trust, add notes, run an on-demand port probe,
-  forget.
-- Scan comparison summary: new, returned, offline, ports opened/closed, and
-  device-information changes, with empty categories omitted.
-- Event Center: a live dashboard panel and a full dialog with severity and
-  device filters, unread counts, click-to-device, and empty/loading/error
-  states.
+  forget (with confirmation).
+- Scan comparison summary: plain-language counts for new, back-online,
+  offline, opened/closed services, and device-information changes.
+- Event Center: a live dashboard panel and a full dialog with plain-language
+  descriptions, severity and device filters, unread counts, click-to-device,
+  and informative empty/loading/error states.
+- First-run trust guide and tooltips explaining Unknown, Trusted, and Ignored;
+  the guide can be reopened from the trust filter.
+- Clear “last scan failed” banner with the error and a retry button.
 - New-device toast plus a temporary `new` row badge, cleared when the device
   drawer is opened.
 - Scan settings dialog: subnet, ports, timeout, concurrency, deep mode,
   per-collector toggles — applied to the next scan.
 - Scan history: a live trend bar chart and recent-scan table backed by SQLite.
-- Auto-scan interval, CSV/JSON export, dark/light-friendly responsive layout.
+- Auto-scan interval, CSV/JSON export, dark/light-friendly responsive layout,
+  larger touch targets, and local-only data indicators.
 
 The server binds to `127.0.0.1` by default. Use `--host 0.0.0.0` only on a
 network you trust; see [Security](#security).
@@ -317,7 +321,7 @@ combined comparison change can produce several specific events, such as a
 hostname event and a port event.
 
 Every event has a unique id, timestamp, network id, type, severity, short
-title, human-readable description, relevant before/after details, and either a
+title, plain-language description, relevant before/after details, and either a
 device IP/name or a related scan id. Severity is centralized in
 `lanwatch/events.py`:
 
@@ -339,7 +343,8 @@ without disrupting the existing snapshot/device/scan events.
 
 Storage is bounded to the newest 5,000 events and pruned after 180 days.
 `HistoryStore` exposes `max_events` and `max_event_age_days` for deployments
-that need different limits. `scan.failed` events are recorded without a scan
+that need different limits; the dashboard shows the active policy in its
+empty Event Center state. `scan.failed` events are recorded without a scan
 row and are not used for comparison.
 
 ## Running on Android / Termux
@@ -365,13 +370,15 @@ On a normal Linux machine all collectors usually work, with or without root.
 - If an `Origin` header is present it must match `Host`; no CORS headers are
   sent.
 - The dashboard sends a restrictive `Content-Security-Policy`.
+- All inventory, scan history, events and browser preferences stay on this
+  device. There is no telemetry, cloud sync, or external asset loading.
 - No authentication: if you bind to a LAN address, anyone who can reach the
   port can scan and edit labels. Don't expose it to the internet.
 
 ## Tests and development
 
 ```bash
-python3 -m unittest discover -s tests -t .   # 201 tests
+python3 -m unittest discover -s tests -t .   # 208 tests
 ruff check .
 mypy
 ```

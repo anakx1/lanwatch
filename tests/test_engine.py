@@ -443,6 +443,64 @@ class EngineTests(unittest.TestCase):
         assert recomputed is not None
         self.assertEqual(recomputed["changes"][0]["details"]["ports_removed"], [443])
 
+    def test_scan_diff_uses_the_scanned_networks_trust(self) -> None:
+        scanned = self.store.activate("10.0.0.0/24", "aa:aa:aa:aa:aa:01")
+        self.store.save()
+        self.engine.history.record_scan(
+            [Device(ip="10.0.0.5", mac="00:11:22:33:44:55", online=True)],
+            started_at=1000.0,
+            finished_at=1001.0,
+            duration_s=1.0,
+            subnet="10.0.0.0/24",
+            interface="wlan0",
+            network_id=scanned.id,
+            baseline=True,
+            events=[],
+        )
+        second = self.engine.history.record_scan(
+            [
+                Device(ip="10.0.0.5", mac="00:11:22:33:44:55", online=True),
+                Device(ip="10.0.0.6", mac="00:11:22:33:44:66", online=True),
+            ],
+            started_at=1002.0,
+            finished_at=1003.0,
+            duration_s=1.0,
+            subnet="10.0.0.0/24",
+            interface="wlan0",
+            network_id=scanned.id,
+            events=[],
+        )
+
+        # The same address is ignored on the network that is currently active.
+        # Recomputing a scan from another network must not inherit that trust.
+        other = self.store.activate("192.168.1.0/24", "bb:bb:bb:bb:bb:01")
+        self.assertNotEqual(other.id, scanned.id)
+        self.store.upsert(Device(ip="10.0.0.6", mac="00:11:22:33:44:66", online=True))
+        self.store.set_trust("10.0.0.6", "ignored")
+        self.store.save()
+
+        diff = self.engine.scan_diff(second)
+        assert diff is not None
+        self.assertEqual(diff["network_id"], scanned.id)
+        self.assertEqual(diff["new_ips"], ["10.0.0.6"])
+        self.assertEqual(diff["counts"]["new"], 1)
+
+    def test_latest_diff_is_scoped_to_its_network(self) -> None:
+        first = self.store.activate("10.0.0.0/24", "aa:aa:aa:aa:aa:01")
+        diff = {
+            "network_id": first.id,
+            "counts": {"new": 1},
+            "new_ips": ["10.0.0.9"],
+            "changes": [],
+        }
+        self.engine.last_diff = diff
+        self.assertEqual(self.engine.latest_diff_for_active(), diff)
+        self.assertEqual(self.engine.snapshot()["latest_diff"], diff)
+
+        self.store.activate("192.168.1.0/24", "bb:bb:bb:bb:bb:01")
+        self.assertIsNone(self.engine.latest_diff_for_active())
+        self.assertNotIn("latest_diff", self.engine.snapshot())
+
     def test_failed_scan_does_not_report_offline(self) -> None:
         self.run_scan()
         scan_count = len(self.engine.history.recent(10))

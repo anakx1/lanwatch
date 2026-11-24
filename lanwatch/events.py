@@ -174,8 +174,8 @@ def _field_event(
     after = details.get(f"{field_name}_after")
     name = _device_name(change)
     description = (
-        f"{name or change.ip} ({change.ip}): {label} "
-        f"{before or 'unknown'} → {after or 'unknown'}"
+        f"{name or change.ip} ({change.ip}): {label} changed from "
+        f"{before or 'not reported'} to {after or 'not reported'}."
     )
     return Event(
         type=event_type,
@@ -207,11 +207,16 @@ def _port_event(
     name = _device_name(change)
     action = "opened" if event_type == "port.opened" else "closed"
     label = _ports_label(ports)
+    explanation = (
+        "A service is now reachable on this device."
+        if action == "opened"
+        else "That service is no longer reachable on this device."
+    )
     return Event(
         type=event_type,
         severity=severity_for(event_type),
-        title=f"{label} {action}",
-        message=f"{name or change.ip} ({change.ip}): {label} {action}",
+        title=f"{label} {action} on {name or change.ip}",
+        message=f"{name or change.ip} ({change.ip}): {label} {action}. {explanation}",
         network_id=network_id,
         device_ip=change.ip,
         device_name=name,
@@ -306,14 +311,25 @@ def events_from_change(
     ]
 
 
+TRUST_EXPLANATIONS = {
+    "trusted": "This is a device you expect on this network.",
+    "unknown": "This device has not been reviewed yet.",
+    "ignored": "Changes for this device are left out of the change log.",
+}
+
+
 def trust_event(device: Device, previous: str, network_id: str | None) -> Event:
     name = device.display_name
     title = f"{name} marked {device.trust}"
+    explanation = TRUST_EXPLANATIONS.get(device.trust, "")
+    message = f"{name} ({device.ip}) is now {device.trust}."
+    if explanation:
+        message = f"{message} {explanation}"
     return Event(
         type="device.trust_changed",
         severity=severity_for("device.trust_changed"),
         title=title,
-        message=f"{device.ip}: {previous} → {device.trust}",
+        message=message,
         network_id=network_id,
         device_ip=device.ip,
         device_name=name,
@@ -322,11 +338,15 @@ def trust_event(device: Device, previous: str, network_id: str | None) -> Event:
 
 
 def scan_failure_event(error: str, network_id: str | None, scan_id: int | None = None) -> Event:
+    message = error.strip() or "The scan stopped before it could finish."
+    if not message.endswith((".", "!", "?")):
+        message = f"{message}."
+    message = f"{message} No comparison was recorded; check the network and try again."
     return Event(
         type="scan.failed",
         severity=severity_for("scan.failed"),
         title="Scan failed",
-        message=error,
+        message=message,
         network_id=network_id,
         scan_id=scan_id,
         details={"error": error},
@@ -340,20 +360,24 @@ def scan_completed_event(
     counts = dict(getattr(diff, "counts", {}) or {})
     current = int(getattr(diff, "current_devices", 0))
     baseline = bool(getattr(diff, "baseline", False))
+    device_word = "device" if current == 1 else "devices"
     if baseline:
-        title = "Scan completed — baseline"
-        message = f"Baseline recorded with {current} device{'s' if current != 1 else ''}"
+        title = "Baseline scan completed"
+        message = (
+            f"First scan recorded {current} {device_word}. "
+            "Future scans will be compared with this one."
+        )
     else:
         title = "Scan completed"
         changes = (
             f"{counts.get('new', 0)} new · "
-            f"{counts.get('returned', 0)} online again · "
+            f"{counts.get('returned', 0)} back online · "
             f"{counts.get('offline', 0)} offline · "
             f"{counts.get('changed', 0)} changed"
         )
         if not any(int(value or 0) for value in counts.values()):
-            changes = "no changes"
-        message = f"{current} device{'s' if current != 1 else ''} seen · {changes}"
+            changes = "no changes since the previous scan"
+        message = f"{current} {device_word} seen · {changes}"
     return Event(
         type="scan.completed",
         severity=severity_for("scan.completed"),

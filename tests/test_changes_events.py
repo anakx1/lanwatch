@@ -288,6 +288,21 @@ class ScanComparisonTests(unittest.TestCase):
         self.assertIn("Acme", change.message)
         self.assertIn("camera", change.message)
 
+    def test_change_descriptions_are_plain_language(self) -> None:
+        diff = compare_snapshots(
+            [snapshot("10.0.0.1"), snapshot("10.0.0.2", hostname="printer")],
+            [snapshot("10.0.0.1"), snapshot("10.0.0.7", hostname="camera")],
+        )
+        changes = {change.event_type: change for change in diff.changes}
+        self.assertIn("New on this network", changes["device.new"].message)
+        self.assertIn("No longer answering", changes["device.offline"].message)
+
+        moved = compare_snapshots(
+            [snapshot("10.0.0.5", mac="3c:22:fb:11:22:33")],
+            [snapshot("10.0.0.9", mac="3c:22:fb:11:22:33")],
+        ).changes[0]
+        self.assertIn("same MAC address", moved.message)
+
     def test_service_change_lists_opened_ports(self) -> None:
         diff = compare_snapshots(
             [snapshot("10.0.0.5", ports=(80,))],
@@ -572,6 +587,37 @@ class EventBuilderTests(unittest.TestCase):
             scan_id=42,
         )
         self.assertTrue(all(event.scan_id == 42 for event in linked))
+
+    def test_event_text_explains_changes_in_plain_language(self) -> None:
+        events = self.by_type(
+            self.events_for(
+                [snapshot("10.0.0.5", hostname="old", ports=(80,))],
+                [snapshot("10.0.0.5", hostname="new", ports=(80, 443))],
+            )
+        )
+        self.assertIn("hostname changed from old to new", events["device.hostname_changed"].message)
+        self.assertIn("service is now reachable", events["port.opened"].message)
+
+        failed = scan_failure_event("no LAN", "net-a")
+        self.assertIn("No comparison was recorded", failed.message)
+        self.assertIn("try again", failed.message)
+
+        trusted = trust_event(
+            Device(ip="10.0.0.5", hostname="router", trust="trusted"),
+            "unknown",
+            "net-a",
+        )
+        self.assertIn("is now trusted", trusted.message)
+        self.assertIn("expect on this network", trusted.message)
+
+        unchanged = events_for_diff(
+            compare_snapshots(
+                [snapshot("10.0.0.1")],
+                [snapshot("10.0.0.1")],
+            ),
+            "net-a",
+        )
+        self.assertIn("no changes since the previous scan", unchanged[0].message)
 
     def test_combined_change_expands_to_specific_events(self) -> None:
         events = self.events_for(

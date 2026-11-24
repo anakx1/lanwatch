@@ -330,6 +330,16 @@ class ScanEngine:
         with self._lock:
             return {name: dict(value) for name, value in self.collectors_state.items()}
 
+    def latest_diff_for_active(self) -> dict[str, Any] | None:
+        """Return the last diff only while its network is still active."""
+        diff = self.last_diff
+        if diff is None:
+            return None
+        diff_network = diff.get("network_id")
+        if diff_network is not None and diff_network != self.store.active_id:
+            return None
+        return diff
+
     def snapshot(self) -> dict[str, Any]:
         data = self.store.snapshot()
         data["state"] = self.state_dict()
@@ -346,9 +356,14 @@ class ScanEngine:
             "path": str(self.history.path),
             "error": self.event_error or self.history_error,
             "unread": unread,
+            "retention": {
+                "max_events": self.history.max_events,
+                "max_event_age_days": self.history.max_event_age_days,
+            },
         }
-        if self.last_diff is not None:
-            data["latest_diff"] = self.last_diff
+        latest_diff = self.latest_diff_for_active()
+        if latest_diff is not None:
+            data["latest_diff"] = latest_diff
         data["host"] = {
             "name": platform.node(),
             "system": platform.system(),
@@ -479,9 +494,19 @@ class ScanEngine:
                 target_network_id, target_subnet, before_scan_id=target_id
             )
             with self.store.lock:
-                trust_map = {
-                    device.ip: device.trust for device in self.store.devices.values()
-                }
+                target_record = (
+                    self.store.networks.get(target_network_id)
+                    if target_network_id
+                    else None
+                )
+                trust_map = (
+                    {
+                        device.ip: device.trust
+                        for device in target_record.devices.values()
+                    }
+                    if target_record is not None
+                    else {}
+                )
 
             def returning(ip: str) -> bool:
                 previous_id = previous.get("id") if isinstance(previous, dict) else None

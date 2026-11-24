@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import socket
 import tempfile
 import threading
 import unittest
@@ -14,6 +15,7 @@ from pathlib import Path
 
 from lanwatch import web
 from lanwatch.discovery import ScanEngine, ScanOptions
+from lanwatch.history import MAX_EVENT_AGE_DAYS, MAX_EVENTS
 from lanwatch.store import Store
 
 from .helpers import patched_scan, wait_until
@@ -71,6 +73,22 @@ class WebTests(unittest.TestCase):
             body = error.read()
             error.close()
             return error.code, dict(error.headers), body
+
+    def raw_request(self, request: bytes) -> tuple[int, bytes]:
+        host, port = self.server.server_address
+        with socket.create_connection((host, port), timeout=5) as connection:
+            connection.sendall(request)
+            connection.shutdown(socket.SHUT_WR)
+            chunks: list[bytes] = []
+            while True:
+                chunk = connection.recv(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        response = b"".join(chunks)
+        head, _, body = response.partition(b"\r\n\r\n")
+        status_line = head.split(b"\r\n", 1)[0]
+        return int(status_line.split()[1]), body
 
     def state(self) -> dict:
         status, _, body = self.request("/api/state")
@@ -148,6 +166,10 @@ class WebTests(unittest.TestCase):
         data = self.state()
         self.assertIn("events", data)
         self.assertGreaterEqual(data["events"]["unread"], 1)
+        self.assertEqual(data["events"]["retention"]["max_events"], MAX_EVENTS)
+        self.assertEqual(
+            data["events"]["retention"]["max_event_age_days"], MAX_EVENT_AGE_DAYS
+        )
         self.assertTrue(data["latest_diff"]["baseline"])
 
         status, _, body = self.request(
@@ -183,6 +205,8 @@ class WebTests(unittest.TestCase):
         log = json.loads(body)
         self.assertTrue(log["ok"])
         self.assertTrue(log["events"])
+        self.assertEqual(log["retention"]["max_events"], MAX_EVENTS)
+        self.assertEqual(log["retention"]["max_event_age_days"], MAX_EVENT_AGE_DAYS)
         self.assertEqual(log["events"][0]["type"], "device.trust_changed")
         self.assertEqual(log["events"][0]["details"]["after"], "trusted")
         event_id = log["events"][0]["id"]
@@ -262,6 +286,38 @@ class WebTests(unittest.TestCase):
         status, _, body = self.request("/api/event-log?before_id=0")
         self.assertEqual(status, 400, body)
 
+    def test_invalid_ids_and_content_length_are_rejected(self) -> None:
+        for path in (
+            "/api/event-log?before_id=9223372036854775808",
+            "/api/scan/diff?scan_id=9223372036854775808",
+        ):
+            status, _, body = self.request(path)
+            self.assertEqual(status, 400, f"{path}: {body}")
+            self.assertFalse(json.loads(body)["ok"])
+
+        for ids in ([9223372036854775808], [-1]):
+            status, _, body = self.request(
+                "/api/event-log/read", "POST", {"ids": ids}, HEADERS
+            )
+            self.assertEqual(status, 400, f"ids={ids}: {body}")
+            self.assertFalse(json.loads(body)["ok"])
+
+        host, port = self.server.server_address
+        request = (
+            b"POST /api/stop HTTP/1.1\r\n"
+            + f"Host: {host}:{port}\r\n".encode()
+            + b"X-Lanwatch: 1\r\n"
+            + b"Content-Type: application/json\r\n"
+            + b"Content-Length: -1\r\n"
+            + b"Connection: close\r\n\r\n{}"
+        )
+        status, body = self.raw_request(request)
+        self.assertEqual(status, 400, body)
+        self.assertFalse(json.loads(body)["ok"])
+
+        status, _, _ = self.request("/api/health")
+        self.assertEqual(status, 200)
+
     def test_history_endpoint_reports_read_errors(self) -> None:
         self.engine.history.recent = unittest.mock.Mock(side_effect=OSError("read-only"))
         status, _, body = self.request("/api/history")
@@ -294,6 +350,11 @@ class WebTests(unittest.TestCase):
             'id="event-device-filter"',
             'id="event-status"',
             'id="events-refresh-modal"',
+            'id="scan-error"',
+            'id="scan-retry"',
+            'id="trust-guide"',
+            'id="trust-help"',
+            'id="drawer-trust-help"',
         ):
             self.assertIn(element, text)
         for severity in ("all", "info", "warning", "critical"):
@@ -324,6 +385,10 @@ class WebTests(unittest.TestCase):
             self.assertIn(f"'{event_type}'", script)
         self.assertIn("function eventStatusHtml", script)
         self.assertIn("data-act=\"refresh-events\"", script)
+        self.assertIn("function retentionText", script)
+        self.assertIn("function trustBadge", script)
+        self.assertIn("badges.push(trustBadge(device.trust || 'unknown'));", script)
+        self.assertIn("scan-now", script)
         self.assertIn("state.newDevices.delete(ip)", script)
 
     def test_mutations_require_header_and_matching_origin(self) -> None:
@@ -408,6 +473,32 @@ class WebTests(unittest.TestCase):
             self.assertEqual(event["type"], "hello")
             self.assertIn("state", event)
             self.assertIn("unread", event)
+        finally:
+            connection.close()
+
+    def test_sse_hello_does_not_leak_an_inactive_diff(self) -> None:
+        previous = self.store.activate("10.20.0.0/24", "aa:aa:aa:aa:aa:01")
+        self.store.activate("10.30.0.0/24", "bb:bb:bb:bb:bb:01")
+        self.engine.last_diff = {
+            "network_id": previous.id,
+            "counts": {"new": 1},
+            "new_ips": ["10.20.0.2"],
+            "changes": [],
+        }
+        self.assertNotIn("latest_diff", self.state())
+
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", self.server.server_address[1], timeout=8
+        )
+        try:
+            connection.request("GET", "/api/events")
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            line = response.readline().decode("utf-8")
+            self.assertTrue(line.startswith("data: "), line)
+            event = json.loads(line[len("data: ") :])
+            self.assertEqual(event["type"], "hello")
+            self.assertNotIn("latest_diff", event)
         finally:
             connection.close()
 

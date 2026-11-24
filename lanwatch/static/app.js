@@ -9,6 +9,7 @@ const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
 
 const PREFS_KEY = 'lanwatch.prefs.v1';
+const TRUST_GUIDE_KEY = 'lanwatch.trustGuideDismissed.v1';
 const COLLECTORS = [
   ['icmp', 'ICMP'],
   ['arp', 'ARP'],
@@ -77,6 +78,21 @@ const EVENT_ICONS = {
 };
 const PANEL_EVENT_LIMIT = 6;
 const EVENT_SEVERITIES = ['all', 'info', 'warning', 'critical'];
+const EVENT_TYPE_LABELS = {
+  'device.new': 'New device',
+  'device.online': 'Back online',
+  'device.offline': 'Went offline',
+  'device.hostname_changed': 'Name changed',
+  'device.vendor_changed': 'Vendor changed',
+  'device.kind_changed': 'Device type changed',
+  'port.opened': 'Service opened',
+  'port.closed': 'Service closed',
+  'scan.completed': 'Scan completed',
+  'scan.failed': 'Scan failed',
+  'device.ip_changed': 'Address changed',
+  'device.replaced': 'Identity changed',
+  'device.trust_changed': 'Trust changed',
+};
 
 const state = {
   devices: new Map(),
@@ -92,13 +108,18 @@ const state = {
   version: '0.1.0',
   statePath: '',
   connected: false,
+  helloSeen: false,
+  stateRequestId: 0,
+  diffRequestId: 0,
   drawerIp: null,
   drawerDirty: false,
   autoTimer: null,
   renderQueued: false,
   search: '',
   latestDiff: null,
+  diffError: null,
   newDevices: new Set(),
+  prefsWarned: false,
   history: { scans: [], path: '', error: null },
   events: {
     items: [],
@@ -111,11 +132,17 @@ const state = {
     unreadOnly: false,
     hasMore: false,
     requestId: 0,
+    retention: { max_events: 0, max_event_age_days: 0 },
   },
   prefs: { showOffline: true, sort: 'ip', autoScan: false, autoInterval: 60, trustFilter: 'all' },
 };
 
 const TRUST_LABELS = { trusted: 'Trusted', unknown: 'Unknown', ignored: 'Ignored' };
+const TRUST_HELP = {
+  trusted: 'A device you recognize and expect on this network. If it goes offline, the change is treated as a warning.',
+  unknown: 'Seen on this network but not reviewed yet. New devices start here; changes are recorded normally.',
+  ignored: 'Kept in the inventory, but its changes are left out of events and alerts.',
+};
 const SEVERITY_LABELS = { info: 'Info', warning: 'Warning', critical: 'Critical' };
 
 /* ------------------------------------------------------------------ */
@@ -196,6 +223,53 @@ function plural(count, word) {
   return `${count} ${word}${count === 1 ? '' : 's'}`;
 }
 
+function trustBadge(trust) {
+  const level = TRUST_LABELS[trust] ? trust : 'unknown';
+  return `<span class="badge ${esc(level)}" title="${esc(TRUST_HELP[level])}">${esc(TRUST_LABELS[level])}</span>`;
+}
+
+function eventTypeLabel(type) {
+  return EVENT_TYPE_LABELS[type] || String(type || 'event').replace(/[._]/g, ' ');
+}
+
+function retentionText() {
+  const retention = state.events.retention || {};
+  const maxEvents = Number(retention.max_events) || 0;
+  const maxDays = Number(retention.max_event_age_days) || 0;
+  const limits = [];
+  if (maxEvents > 0) limits.push(`up to ${maxEvents.toLocaleString()} events`);
+  if (maxDays > 0) limits.push(`${maxDays} days`);
+  return limits.length ? `Kept on this device: ${limits.join(' or ')}.` : 'Events are kept on this device.';
+}
+
+function readTrustGuideDismissed() {
+  try {
+    return localStorage.getItem(TRUST_GUIDE_KEY) === '1';
+  } catch (error) {
+    console.warn('lanwatch: could not read local preferences', error);
+    return false;
+  }
+}
+
+function setTrustGuideVisible(visible, scroll = false) {
+  const guide = $('#trust-guide');
+  if (!guide) return;
+  guide.hidden = !visible;
+  if (visible && scroll) {
+    const target = $('#trust-guide-title');
+    if (target) target.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }
+}
+
+function dismissTrustGuide() {
+  setTrustGuideVisible(false);
+  try {
+    localStorage.setItem(TRUST_GUIDE_KEY, '1');
+  } catch (error) {
+    console.warn('lanwatch: could not remember the trust guide was dismissed', error);
+  }
+}
+
 async function api(path, options = {}) {
   const { method = 'GET', body } = options;
   const headers = { 'X-Lanwatch': '1' };
@@ -209,11 +283,15 @@ async function api(path, options = {}) {
   let data = null;
   try {
     data = await response.json();
-  } catch (_) {
+  } catch (error) {
+    if (response.ok) console.warn('lanwatch: server returned an unreadable response', error);
     data = null;
   }
   if (!response.ok) {
-    throw new Error((data && data.error) || `Request failed (${response.status})`);
+    const error = new Error((data && data.error) || `Request failed (${response.status})`);
+    error.status = response.status;
+    error.data = data;
+    throw error;
   }
   return data || {};
 }
@@ -223,6 +301,7 @@ function toast(message, kind = '') {
   if (!host) return;
   const element = document.createElement('div');
   element.className = 'toast' + (kind ? ` ${kind}` : '');
+  element.setAttribute('role', kind === 'error' ? 'alert' : 'status');
   element.textContent = message;
   host.appendChild(element);
   while (host.children.length > 4) host.firstElementChild.remove();
@@ -241,7 +320,18 @@ function upsertDevice(device) {
   state.devices.set(device.ip, device);
 }
 
+function activeNetworkId() {
+  return state.activeNetwork && state.activeNetwork.id ? String(state.activeNetwork.id) : '';
+}
+
+function eventMatchesActiveNetwork(event) {
+  const active = activeNetworkId();
+  const network = event && event.network_id;
+  return !active || !network || String(network) === active;
+}
+
 function applySnapshot(data) {
+  const previousActive = activeNetworkId();
   state.devices = new Map((data.devices || []).map((device) => [device.ip, device]));
   if (data.state) state.scan = data.state;
   if (data.collectors) state.collectors = data.collectors;
@@ -253,6 +343,7 @@ function applySnapshot(data) {
   state.host = data.host || null;
   state.version = data.version || state.version;
   state.statePath = data.state_path || '';
+  if (previousActive !== activeNetworkId() && state.drawerIp) closeDrawer();
   if (data.history) {
     state.history.path = data.history.path || '';
     state.history.error = data.history.error || null;
@@ -261,29 +352,46 @@ function applySnapshot(data) {
     state.events.path = data.events.path || state.events.path;
     state.events.error = data.events.error || null;
     state.events.unread = Number(data.events.unread) || 0;
+    if (data.events.retention) state.events.retention = data.events.retention;
   }
-  state.latestDiff = data.latest_diff || null;
+  const latestDiff = data.latest_diff || null;
+  state.latestDiff = latestDiff && eventMatchesActiveNetwork(latestDiff) ? latestDiff : null;
+  if (state.latestDiff) state.diffError = null;
   setNewDevices(state.latestDiff);
   renderAll();
 }
 
 function handleEvent(event) {
   switch (event.type) {
-    case 'hello':
+    case 'hello': {
+      const reconnected = state.helloSeen;
+      state.helloSeen = true;
       if (event.state) state.scan = event.state;
       if (event.unread != null) state.events.unread = Number(event.unread) || 0;
-      if (event.latest_diff) {
+      if (event.latest_diff && eventMatchesActiveNetwork(event.latest_diff)) {
         state.latestDiff = event.latest_diff;
         setNewDevices(state.latestDiff);
       }
       setSync(true);
+      if (reconnected) {
+        // The stream may have been down while another tab switched networks or
+        // a scan finished.  Reload everything the snapshot owns.
+        loadHistory();
+        loadState().then(() => {
+          loadLatestDiff();
+          loadEvents(true, true);
+        });
+      }
       break;
+    }
     case 'scan.started':
       if (event.state) state.scan = event.state;
       if (event.network) state.network = event.network;
       if (event.options) state.options = event.options;
       state.latestDiff = null;
       state.newDevices = new Set();
+      state.diffError = null;
+      state.diffRequestId += 1;
       state.collectors = {};
       COLLECTORS.forEach(([name]) => {
         state.collectors[name] = { status: 'pending', detail: 'waiting', count: 0 };
@@ -299,17 +407,32 @@ function handleEvent(event) {
     case 'network':
       state.network = event.network || state.network;
       break;
-    case 'network.changed':
+    case 'network.changed': {
+      const previousActive = state.activeNetwork ? state.activeNetwork.id : null;
       state.networks = event.networks || state.networks;
-      state.events.device = '';
-      renderNetworks();
-      // The active inventory changed (scan on another network, or a switch from
-      // another browser tab): reload so the device list matches.
-      if ((state.activeNetwork && state.activeNetwork.id) !== event.active) {
+      const nextActive = event.active || null;
+      if (previousActive !== nextActive) {
+        // Update the active id before reloading so event and diff responses are
+        // filtered against the network that is actually active now.
+        state.activeNetwork = state.networks.find((network) => network.id === nextActive) || null;
+        if (state.network && state.network.network_id !== nextActive) state.network = null;
+        if (state.drawerIp) closeDrawer();
+        state.devices = new Map();
+        state.events.device = '';
+        state.events.items = [];
+        state.events.unread = 0;
+        state.events.hasMore = false;
+        state.events.error = null;
+        state.latestDiff = null;
+        state.diffError = null;
+        state.newDevices = new Set();
         loadState();
+        loadLatestDiff();
         loadEvents(true, true);
       }
+      renderNetworks();
       break;
+    }
     case 'device':
       upsertDevice(event.device);
       if (state.drawerIp === (event.device && event.device.ip)) renderDrawerStats();
@@ -319,17 +442,24 @@ function handleEvent(event) {
       state.newDevices.delete(event.ip);
       if (state.drawerIp === event.ip) closeDrawer();
       break;
-    case 'scan.diff':
-      state.latestDiff = event.diff || event;
+    case 'scan.diff': {
+      const diff = event.diff || event;
+      if (!eventMatchesActiveNetwork(diff)) break;
+      state.latestDiff = diff;
+      state.diffError = null;
       setNewDevices(state.latestDiff);
       announceDiff(state.latestDiff);
       if ($('#event-center') && $('#event-center').open) loadEvents(true, true);
       break;
-    case 'event.new':
+    }
+    case 'event.new': {
       // Event files are already persisted server-side.  Update just the event
       // panel and dialog instead of repainting the whole dashboard.
-      acceptEvent(event.event || event);
+      const incoming = event.event || event;
+      if (!eventMatchesActiveNetwork(incoming)) return;
+      acceptEvent(incoming);
       return;
+    }
     case 'scan.finished':
       if (event.state) state.scan = event.state;
       if (event.stopped) {
@@ -419,6 +549,7 @@ function renderNetwork() {
 
   dot.className = 'net-dot';
   if (state.scan.running) dot.classList.add('scanning');
+  else if (state.scan.phase === 'error') dot.classList.add('error');
   else if (state.scan.phase === 'done') dot.classList.add('live');
 }
 
@@ -455,9 +586,11 @@ function renderScan() {
   const scan = state.scan || {};
   const running = !!scan.running;
   const phase = scan.phase || 'idle';
+  const failed = !running && (phase === 'error' || !!scan.error);
   const pulse = $('#scan-pulse');
   const bar = $('#progress-bar');
   const track = bar.parentElement;
+  const panel = $('#scan-panel');
 
   $('#scan-phase').textContent = PHASE_LABELS[phase] || phase;
 
@@ -480,20 +613,35 @@ function renderScan() {
   pulse.className = 'pulse';
   if (running) pulse.classList.add('active');
   else if (phase === 'done') pulse.classList.add('done');
-  else if (phase === 'error') pulse.classList.add('error');
+  else if (failed) pulse.classList.add('error');
+  if (panel) panel.classList.toggle('scan-panel--error', failed);
+
+  const errorBox = $('#scan-error');
+  if (errorBox) {
+    errorBox.hidden = !failed;
+    if (failed) {
+      const text = scan.error || scan.message || 'The scan stopped before it could finish.';
+      const target = $('#scan-error-text');
+      if (target && target.textContent !== text) target.textContent = text;
+      errorBox.title = text;
+    }
+  }
 
   track.classList.remove('indeterminate');
+  let percent = phase === 'done' ? 100 : 0;
   if (running) {
     if (scan.total > 0 && scan.done > 0) {
-      const percent = Math.max(2, Math.min(100, (scan.done / scan.total) * 100));
+      percent = Math.max(2, Math.min(100, (scan.done / scan.total) * 100));
       bar.style.width = `${percent}%`;
     } else {
       track.classList.add('indeterminate');
       bar.style.width = '';
     }
   } else {
-    bar.style.width = phase === 'done' ? '100%' : '0%';
+    bar.style.width = `${percent}%`;
   }
+  track.setAttribute('aria-valuenow', String(Math.round(percent)));
+  track.setAttribute('aria-valuetext', running ? 'scan in progress' : phase === 'done' ? 'scan complete' : 'scan idle');
 
   $('#scan-btn').hidden = running;
   $('#stop-btn').hidden = !running;
@@ -502,14 +650,14 @@ function renderScan() {
 function diffParts(diff) {
   const counts = (diff && diff.counts) || {};
   const parts = [];
-  const add = (key, label, value) => {
+  const add = (key, singular, pluralLabel, value) => {
     const number = Number(value) || 0;
-    if (number > 0) parts.push({ key, label, value: number });
+    if (number > 0) parts.push({ key, label: number === 1 ? singular : pluralLabel, value: number });
   };
 
-  add('new', 'new', counts.new);
-  add('returned', 'returned', counts.returned);
-  add('offline', 'offline', counts.offline);
+  add('new', 'new device', 'new devices', counts.new);
+  add('returned', 'back online', 'back online', counts.returned);
+  add('offline', 'went offline', 'went offline', counts.offline);
 
   let portsAdded = 0;
   let portsRemoved = 0;
@@ -526,14 +674,20 @@ function diffParts(diff) {
       infoChanges += 1;
     }
   });
-  add('ports_added', portsAdded === 1 ? 'port added' : 'ports added', portsAdded);
-  add('ports_removed', portsRemoved === 1 ? 'port removed' : 'ports removed', portsRemoved);
+  add('ports_added', 'new service', 'new services', portsAdded);
+  add('ports_removed', 'closed service', 'closed services', portsRemoved);
   if (!portsAdded && !portsRemoved && !infoChanges) {
     // Older or partial comparison payloads may not carry details.
     infoChanges = Number(counts.changed) || 0;
   }
-  add('info', infoChanges === 1 ? 'information change' : 'information changes', infoChanges);
+  add('info', 'detail changed', 'details changed', infoChanges);
   return parts;
+}
+
+function diffSummary(diff) {
+  const parts = diffParts(diff);
+  if (!parts.length) return 'No changes since the previous scan.';
+  return `Since the last scan: ${parts.map((part) => `${part.value} ${part.label}`).join(', ')}.`;
 }
 
 function renderDiff() {
@@ -541,31 +695,41 @@ function renderDiff() {
   if (!host) return;
   const diff = state.latestDiff;
   if (!diff || state.scan.running) {
+    if (!diff && state.diffError && !state.scan.running) {
+      host.hidden = false;
+      host.className = 'scan-diff partial';
+      host.innerHTML = `<span class="diff-tag">comparison</span><span class="diff-copy">Could not load the latest changes · ${esc(state.diffError)}</span>`;
+      return;
+    }
     host.hidden = true;
     host.innerHTML = '';
+    host.removeAttribute('title');
+    host.removeAttribute('aria-label');
     return;
   }
   host.hidden = false;
   host.className = 'scan-diff';
+  host.title = '';
+  host.setAttribute('aria-label', diffSummary(diff));
   if (diff.baseline) {
     host.classList.add('baseline');
-    host.innerHTML = `<span class="diff-tag">baseline</span><span class="diff-copy">${plural(Number(diff.current_devices) || 0, 'device')} recorded for future comparisons</span>`;
+    host.innerHTML = `<span class="diff-tag">baseline</span><span class="diff-copy">${plural(Number(diff.current_devices) || 0, 'device')} recorded. The next scan will show what changed.</span>`;
     return;
   }
   if (diff.partial) {
     host.classList.add('partial');
-    host.innerHTML = '<span class="diff-tag">partial</span><span class="diff-copy">Scan stopped early · comparison skipped</span>';
+    host.innerHTML = '<span class="diff-tag">partial</span><span class="diff-copy">Scan stopped early, so no comparison was saved.</span>';
     return;
   }
   const parts = diffParts(diff);
   if (!parts.length) {
     host.classList.add('quiet');
-    host.innerHTML = '<span class="diff-tag">unchanged</span><span class="diff-copy">No changes since the previous scan</span>';
+    host.innerHTML = '<span class="diff-tag">unchanged</span><span class="diff-copy">No changes — the devices and services look the same as the previous scan.</span>';
     return;
   }
   const titles = (diff.changes || []).map((change) => change.title).filter(Boolean).slice(0, 6).join('\n');
-  host.title = titles;
-  host.innerHTML = `<span class="diff-tag">changes</span>${parts
+  host.title = titles || diffSummary(diff);
+  host.innerHTML = `<span class="diff-tag">since last scan</span>${parts
     .map((part) => `<span class="diff-pill ${esc(part.key)}"><b>${part.value}</b> ${esc(part.label)}</span>`)
     .join('')}`;
 }
@@ -594,9 +758,11 @@ function renderEventBadge() {
   const unread = Number(state.events.unread) || 0;
   badge.hidden = unread <= 0;
   badge.textContent = unread > 99 ? '99+' : String(unread);
+  badge.setAttribute('aria-hidden', 'true');
   const button = $('#events-btn');
   if (button) {
     button.title = unread ? `Event center · ${plural(unread, 'unread event')}` : 'Event center';
+    button.setAttribute('aria-label', unread ? `Event center, ${plural(unread, 'unread event')}` : 'Event center');
   }
 }
 
@@ -664,8 +830,8 @@ function renderTable() {
       $('#empty-text').textContent = query
         ? `Nothing matches “${query}”${state.prefs.showOffline ? '' : ' while offline devices are hidden'}.`
         : trustActive
-          ? `No ${TRUST_LABELS[trustFilter] || trustFilter} devices.`
-          : 'Offline devices are hidden.';
+          ? `No ${TRUST_LABELS[trustFilter] || trustFilter} devices right now. ${TRUST_HELP[trustFilter] || ''}`.trim()
+          : 'Offline devices are hidden. Turn on “Offline” to show them.';
       emptyScan.hidden = false;
       emptyScan.textContent = 'Clear filters';
       emptyScan.dataset.action = 'clear';
@@ -718,6 +884,7 @@ function renderHistory() {
     $('#history-rows').innerHTML = scans
       .map((scan) => {
         const status = scan.error ? 'error' : scan.stopped ? 'stopped' : 'ok';
+        const statusLabel = { ok: 'complete', stopped: 'stopped', error: 'failed' }[status];
         const found = Number(scan.devices_found) || 0;
         const up = Number(scan.hosts_up) || 0;
         const changes =
@@ -728,7 +895,7 @@ function renderHistory() {
         const changeText = scan.baseline ? 'base' : changes ? String(changes) : '—';
         const changeTitle = scan.baseline
           ? 'First scan for this network'
-          : `${Number(scan.new_devices) || 0} new · ${Number(scan.returned_devices) || 0} returned · ${Number(scan.offline_devices) || 0} offline · ${Number(scan.changed_devices) || 0} changed`;
+          : `${Number(scan.new_devices) || 0} new · ${Number(scan.returned_devices) || 0} back online · ${Number(scan.offline_devices) || 0} offline · ${Number(scan.changed_devices) || 0} changed`;
         return `<tr title="${esc(absolute(scan.finished_at))}">
           <td><span data-ts="${Number(scan.finished_at) || 0}">${ago(scan.finished_at)}</span></td>
           <td class="mono col-history-network">${esc(scan.subnet || '—')}</td>
@@ -736,7 +903,7 @@ function renderHistory() {
           <td class="num col-history-up">${up}</td>
           <td class="col-history-duration">${formatDuration(scan.duration_s)}</td>
           <td class="num col-history-changes" title="${esc(changeTitle)}">${changeText}</td>
-          <td><span class="status ${status}">${status}</span></td>
+          <td><span class="status ${status}">${statusLabel}</span></td>
         </tr>`;
       })
       .join('');
@@ -808,13 +975,12 @@ function rowHtml(device) {
   if (!subBits.length && (device.sources || []).length) subBits.push(`via ${device.sources.join(', ')}`);
   const sub = subBits.join(' · ');
 
-  const trust = device.trust || 'unknown';
   const isNew = state.newDevices.has(device.ip);
   const badges = [];
   if (isNew) badges.push('<span class="badge new">new</span>');
   if (device.is_gateway) badges.push('<span class="badge gw">gateway</span>');
   if (device.is_self) badges.push('<span class="badge self">this device</span>');
-  badges.push(`<span class="badge ${esc(trust)}">${esc(TRUST_LABELS[trust] || trust)}</span>`);
+  badges.push(trustBadge(device.trust || 'unknown'));
   if (!online) badges.push('<span class="badge off">offline</span>');
 
   const ports = device.ports || [];
@@ -897,7 +1063,7 @@ function eventHtml(event) {
   const meta = [];
   if (device) meta.push(`<span class="event-device">${esc(device)}</span>`);
   meta.push(`<span class="event-time" data-ts="${Number(event.ts) || 0}">${esc(ago(event.ts))}</span>`);
-  if (type) meta.push(`<span class="event-type">${esc(type)}</span>`);
+  if (type) meta.push(`<span class="event-type" title="${esc(type)}">${esc(eventTypeLabel(type))}</span>`);
   return `<li class="event-item sev-${severity} ${event.read ? 'read' : 'unread'}" data-id="${esc(event.id || '')}"${clickable ? ` data-ip="${esc(ip)}"` : ''} tabindex="0" title="${esc(description || title)}">
       <span class="event-icon sev-${severity}" aria-hidden="true">${eventIcon(event.type)}</span>
       <span class="event-main">
@@ -916,17 +1082,20 @@ function eventStatusHtml(visibleCount) {
     return `<span class="spinner" aria-hidden="true"></span><span>${state.events.items.length ? 'Refreshing events…' : 'Loading events…'}</span>`;
   }
   if (state.events.error) {
-    return `<span>Event log unavailable · ${esc(state.events.error)}</span><button class="btn ghost small" type="button" data-act="refresh-events">Retry</button>`;
+    return `<div class="event-empty"><strong>Event log unavailable</strong><span>${esc(state.events.error)}</span><button class="btn ghost small" type="button" data-act="refresh-events">Retry</button></div>`;
   }
   const filtering = state.events.severity !== 'all' || !!state.events.device || state.events.unreadOnly;
   if (!state.events.items.length) {
     if (filtering) {
-      return '<span>No events match these filters.</span><button class="btn ghost small" type="button" data-act="clear-event-filters">Clear filters</button>';
+      return '<div class="event-empty"><strong>No events match these filters</strong><span>Try “All” or choose another device.</span><button class="btn ghost small" type="button" data-act="clear-event-filters">Clear filters</button></div>';
     }
-    return '<span>No events yet. Scan twice to see changes between scans.</span>';
+    if (state.scan.running) {
+      return '<div class="event-empty"><strong>Scanning…</strong><span>Changes appear after the scan finishes and is compared with the previous one.</span></div>';
+    }
+    return `<div class="event-empty"><strong>No events yet</strong><span>lanwatch records changes after each completed scan. Run a scan, then run another one to see what changed.</span><span class="event-empty-note">${esc(retentionText())}</span><button class="btn ghost small" type="button" data-act="scan-now">Scan now</button></div>`;
   }
   if (!visibleCount) {
-    return '<span>No events match these filters.</span><button class="btn ghost small" type="button" data-act="clear-event-filters">Clear filters</button>';
+    return '<div class="event-empty"><strong>No events match these filters</strong><span>Your event log has other entries. Try “All” or clear the device filter.</span><button class="btn ghost small" type="button" data-act="clear-event-filters">Clear filters</button></div>';
   }
   return '';
 }
@@ -978,6 +1147,7 @@ function renderEventPanel() {
   const shown = visible.slice(0, PANEL_EVENT_LIMIT);
   list.innerHTML = shown.map(eventHtml).join('');
   list.hidden = shown.length === 0;
+  list.setAttribute('aria-busy', state.events.loading ? 'true' : 'false');
   const statusHtml = eventStatusHtml(visible.length);
   status.innerHTML = statusHtml;
   status.hidden = !statusHtml;
@@ -990,6 +1160,7 @@ function renderEventPanel() {
   const bits = [`${plural(visible.length, 'event')} loaded`, `${unread} unread`];
   if (state.events.unreadOnly) bits.push('unread only');
   if (visible.length > shown.length) bits.push(`showing latest ${PANEL_EVENT_LIMIT}`);
+  if (!visible.length && !state.events.loading && !state.events.error) bits.push(retentionText());
   hint.textContent = bits.join(' · ');
 }
 
@@ -1001,12 +1172,14 @@ function renderEvents() {
   const visible = filteredEvents();
   list.innerHTML = visible.map(eventHtml).join('');
   list.hidden = visible.length === 0;
+  list.setAttribute('aria-busy', state.events.loading ? 'true' : 'false');
   const statusHtml = eventStatusHtml(visible.length);
   status.innerHTML = statusHtml;
   status.hidden = !statusHtml;
   const unread = Number(state.events.unread) || 0;
   const bits = [`${plural(visible.length, 'event')} shown`, `${unread} unread`];
   if (state.events.path) bits.push(`log ${state.events.path}`);
+  if (!visible.length && !state.events.loading && !state.events.error) bits.push(retentionText());
   hint.textContent = bits.join(' · ');
   const more = $('#events-load-more');
   if (more) more.hidden = !state.events.hasMore;
@@ -1068,9 +1241,11 @@ async function loadEvents(reset = true, quiet = false) {
     state.events.hasMore = !!data.has_more;
     state.events.path = data.path || state.events.path;
     state.events.error = data.error || null;
+    if (data.retention) state.events.retention = data.retention;
   } catch (error) {
     if (requestId !== state.events.requestId) return;
     state.events.error = error.message || 'unavailable';
+    console.warn('lanwatch: event log could not be loaded', error);
     if (!quiet) toast(`Event log unavailable: ${state.events.error}`, 'error');
   } finally {
     if (requestId === state.events.requestId) {
@@ -1123,8 +1298,9 @@ async function markEventRead(id) {
     item.read_at = Date.now() / 1000;
     state.events.unread = Number(data.unread) || 0;
     renderEventViews();
-  } catch (_) {
-    /* reading an individual event is best effort */
+  } catch (error) {
+    console.warn('lanwatch: could not mark an event as read', error);
+    toast(error.message || 'Could not mark the event as read', 'error');
   }
 }
 
@@ -1149,19 +1325,37 @@ function onEventStatusClick(event) {
     state.events.device = '';
     state.events.unreadOnly = false;
     loadEvents(true);
+  } else if (action.dataset.act === 'scan-now') {
+    if (state.scan.running) {
+      toast('A scan is already running');
+    } else {
+      startScan({});
+    }
   }
 }
 
 async function loadLatestDiff() {
   if (state.scan.running) return;
+  const requestId = ++state.diffRequestId;
   try {
     const data = await api('/api/scan/diff');
+    if (requestId !== state.diffRequestId || state.scan.running) return;
     state.latestDiff = data;
+    state.diffError = null;
     setNewDevices(data);
     renderDiff();
     renderTable();
-  } catch (_) {
-    /* no scan yet, or history is unavailable */
+  } catch (error) {
+    if (requestId !== state.diffRequestId || state.scan.running) return;
+    if (error && error.status === 404) {
+      // No completed scan to compare yet; this is not a dashboard error.
+      state.diffError = null;
+      renderDiff();
+      return;
+    }
+    state.diffError = (error && error.message) || 'comparison unavailable';
+    console.warn('lanwatch: latest scan comparison could not be loaded', error);
+    renderDiff();
   }
 }
 
@@ -1226,14 +1420,23 @@ function renderDrawer(device) {
   else badges.push('<span class="badge off">offline</span>');
   if (device.is_gateway) badges.push('<span class="badge gw">gateway</span>');
   if (device.is_self) badges.push('<span class="badge self">this device</span>');
-  badges.push(`<span class="badge ${esc(trust)}">${esc(TRUST_LABELS[trust] || trust)}</span>`);
+  badges.push(trustBadge(trust));
   badges.push(`<span class="badge">${esc(KIND_LABELS[device.kind] || device.kind || 'device')}${confidenceHtml(device)}</span>`);
   $('#drawer-badges').innerHTML = badges.join('');
 
   if (document.activeElement !== $('#drawer-label')) $('#drawer-label').value = device.label || '';
   if (document.activeElement !== $('#drawer-notes')) $('#drawer-notes').value = device.notes || '';
   if (document.activeElement !== $('#drawer-trust')) $('#drawer-trust').value = device.trust || 'unknown';
+  renderTrustHelp(device.trust || 'unknown');
   renderDrawerStats(device);
+}
+
+function renderTrustHelp(value) {
+  const level = TRUST_LABELS[value] ? value : 'unknown';
+  const host = $('#drawer-trust-help');
+  const select = $('#drawer-trust');
+  if (host) host.textContent = `${TRUST_LABELS[level]}: ${TRUST_HELP[level]}`;
+  if (select) select.setAttribute('title', TRUST_HELP[level]);
 }
 
 function confidenceHtml(device) {
@@ -1385,7 +1588,10 @@ async function forgetDrawer() {
   if (!ip) return;
   const device = state.devices.get(ip);
   const name = (device && device.name) || ip;
-  if (!window.confirm(`Remove ${name} (${ip}) from the inventory?`)) return;
+  const confirmed = window.confirm(
+    `Forget ${name} (${ip})?\n\nThis removes the device from the saved inventory. The next scan will add it back if it is still online.`
+  );
+  if (!confirmed) return;
   try {
     await api('/api/forget', { method: 'POST', body: { ip } });
     state.devices.delete(ip);
@@ -1506,17 +1712,18 @@ function renderNetworks() {
       `seen ${ago(net.last_seen)}`,
     ].filter(Boolean).join(' · ');
     const id = esc(net.id);
+    const title = esc(net.title);
     const actions = [];
     if (!net.active) {
-      actions.push(`<button class="btn primary" data-act="select" data-id="${id}" ${busy ? 'disabled' : ''}>Switch</button>`);
+      actions.push(`<button class="btn primary" data-act="select" data-id="${id}" title="Make ${title} the active network" ${busy ? 'disabled' : ''}>Switch to</button>`);
     }
-    actions.push(`<button class="btn ghost" data-act="rename" data-id="${id}">Rename</button>`);
+    actions.push(`<button class="btn ghost" data-act="rename" data-id="${id}" title="Rename ${title}">Rename</button>`);
     if (!net.active) {
-      actions.push(`<button class="btn ghost" data-act="archive" data-id="${id}">${net.archived ? 'Restore' : 'Archive'}</button>`);
-      actions.push(`<button class="btn ghost danger-text" data-act="delete" data-id="${id}">Delete</button>`);
+      actions.push(`<button class="btn ghost" data-act="archive" data-id="${id}" title="${net.archived ? `Restore ${title}` : `Hide ${title}; its history and events stay saved`}">${net.archived ? 'Restore' : 'Archive'}</button>`);
+      actions.push(`<button class="btn ghost danger-text" data-act="delete" data-id="${id}" title="Delete ${title} and its saved devices">Delete</button>`);
     }
     return `<li class="net-item ${net.active ? 'active' : ''} ${net.archived ? 'archived' : ''}" data-id="${id}">
-        <span class="net-title">${esc(net.title)}</span>
+        <span class="net-title">${title}</span>
         ${net.active ? '<span class="badge self">active</span>' : net.archived ? '<span class="badge off">archived</span>' : '<span></span>'}
         <span class="net-meta">${esc(meta)}</span>
         <span class="net-actions">${actions.join('')}</span>
@@ -1531,6 +1738,7 @@ async function networkAction(action, id, extra = {}) {
     if (action === 'select') {
       state.events.device = '';
       state.latestDiff = null;
+      state.diffError = null;
       state.newDevices = new Set();
       await loadState();
       closeNetworks();
@@ -1582,7 +1790,8 @@ function onNetworkListClick(event) {
   } else if (act === 'delete') {
     const net = state.networks.find((n) => n.id === id);
     const name = net ? net.title : 'this network';
-    if (window.confirm(`Delete ${name} and its ${net ? plural(net.devices, 'saved device') : 'devices'}? This cannot be undone.`)) {
+    const devices = net ? plural(net.devices, 'saved device') : 'saved devices';
+    if (window.confirm(`Delete ${name} and its ${devices}?\n\nScan history and events are shared and stay saved. This cannot be undone.`)) {
       networkAction('delete', id);
     }
   }
@@ -1596,8 +1805,8 @@ function loadPrefs() {
   try {
     const stored = JSON.parse(localStorage.getItem(PREFS_KEY) || '{}');
     Object.assign(state.prefs, stored || {});
-  } catch (_) {
-    /* ignore corrupt prefs */
+  } catch (error) {
+    console.warn('lanwatch: saved preferences could not be read', error);
   }
   state.prefs.showOffline = state.prefs.showOffline !== false;
   state.prefs.sort = ['ip', 'name', 'latency', 'seen', 'services'].includes(state.prefs.sort) ? state.prefs.sort : 'ip';
@@ -1611,8 +1820,12 @@ function loadPrefs() {
 function savePrefs() {
   try {
     localStorage.setItem(PREFS_KEY, JSON.stringify(state.prefs));
-  } catch (_) {
-    /* private mode */
+  } catch (error) {
+    console.warn('lanwatch: preferences could not be saved locally', error);
+    if (!state.prefsWarned) {
+      state.prefsWarned = true;
+      toast('Preferences could not be saved in this browser', 'warn');
+    }
   }
 }
 
@@ -1641,12 +1854,16 @@ function connectEvents() {
   if (!window.EventSource) return;
   const source = new EventSource('/api/events');
   source.onopen = () => setSync(true);
-  source.onerror = () => setSync(false);
+  source.onerror = () => {
+    if (state.connected) console.warn('lanwatch: live event stream disconnected; retrying');
+    setSync(false);
+  };
   source.onmessage = (message) => {
     let payload;
     try {
       payload = JSON.parse(message.data);
-    } catch (_) {
+    } catch (error) {
+      console.warn('lanwatch: ignored an unreadable live event', error);
       return;
     }
     handleEvent(payload);
@@ -1660,6 +1877,10 @@ function connectEvents() {
 function bindEvents() {
   $('#scan-btn').addEventListener('click', () => startScan({}));
   $('#stop-btn').addEventListener('click', stopScan);
+  $('#scan-retry').addEventListener('click', () => startScan({}));
+  $('#trust-help').addEventListener('click', () => setTrustGuideVisible(true, true));
+  $('#trust-guide-close').addEventListener('click', dismissTrustGuide);
+  $('#trust-guide-done').addEventListener('click', dismissTrustGuide);
   $('#empty-scan').addEventListener('click', (event) => {
     if (event.currentTarget.dataset.action === 'clear') {
       state.search = '';
@@ -1812,8 +2033,9 @@ function bindEvents() {
     try {
       await navigator.clipboard.writeText(ip);
       toast('IP address copied');
-    } catch (_) {
-      toast(ip);
+    } catch (error) {
+      console.warn('lanwatch: clipboard is unavailable', error);
+      toast(`Copy unavailable · ${ip}`, 'warn');
     }
   });
   $('#drawer-label').addEventListener('input', () => {
@@ -1822,7 +2044,8 @@ function bindEvents() {
   $('#drawer-notes').addEventListener('input', () => {
     state.drawerDirty = true;
   });
-  $('#drawer-trust').addEventListener('change', () => {
+  $('#drawer-trust').addEventListener('change', (event) => {
+    renderTrustHelp(event.target.value);
     state.drawerDirty = true;
   });
 
@@ -1840,12 +2063,12 @@ function bindEvents() {
   });
 
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) {
-      loadState();
-      loadHistory();
+    if (document.hidden) return;
+    loadHistory();
+    loadState().then(() => {
       loadLatestDiff();
-      if ($('#event-center') && $('#event-center').open) loadEvents(true, true);
-    }
+      loadEvents(true, true);
+    });
   });
 }
 
@@ -1854,11 +2077,15 @@ function bindEvents() {
 /* ------------------------------------------------------------------ */
 
 async function loadState() {
+  const requestId = ++state.stateRequestId;
   try {
     const data = await api('/api/state');
+    if (requestId !== state.stateRequestId) return;
     applySnapshot(data);
   } catch (error) {
+    if (requestId !== state.stateRequestId) return;
     setSync(false);
+    console.warn('lanwatch: dashboard state could not be loaded', error);
     toast(`Cannot reach lanwatch: ${error.message}`, 'error');
   }
 }
@@ -1871,6 +2098,7 @@ async function loadHistory() {
     state.history.error = data.error || null;
   } catch (error) {
     state.history.error = error.message || 'unavailable';
+    console.warn('lanwatch: scan history could not be loaded', error);
   }
   renderHistory();
 }
@@ -1892,6 +2120,7 @@ async function init() {
   loadPrefs();
   applyPrefs();
   bindEvents();
+  setTrustGuideVisible(!readTrustGuideDismissed());
   setupAutoScan();
   await Promise.all([loadState(), loadHistory()]);
   loadEvents(true, true);

@@ -63,13 +63,13 @@
               <circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/>
             </svg>
           </button>
-          <button class="btn primary" id="scan-btn">
+          <button class="btn primary" id="scan-btn" title="Start a scan">
             <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" aria-hidden="true">
               <circle cx="12" cy="12" r="2.6"/><circle cx="12" cy="12" r="7"/><path d="M12 12l6.5-6.5"/>
             </svg>
             <span>Scan</span>
           </button>
-          <button class="btn danger" id="stop-btn" hidden>
+          <button class="btn danger" id="stop-btn" title="Stop the running scan" hidden>
             <svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
             <span>Stop</span>
           </button>
@@ -101,7 +101,7 @@
         </article>
       </section>
 
-      <section class="scan-panel" aria-label="Scan status">
+      <section class="scan-panel" id="scan-panel" aria-label="Scan status">
         <div class="scan-line">
           <span class="pulse" id="scan-pulse" aria-hidden="true"></span>
           <div class="scan-info" role="status" aria-live="polite">
@@ -110,9 +110,45 @@
           </div>
           <span class="sync" id="sync" title="Live event stream">connecting…</span>
         </div>
-        <div class="progress" aria-hidden="true"><span id="progress-bar"></span></div>
+        <div class="progress" id="scan-progress" role="progressbar" aria-label="Scan progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="progress-bar"></span></div>
+        <div class="scan-error" id="scan-error" role="alert" hidden>
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M12 3.5L21 20H3z"/><path d="M12 9v5"/><circle cx="12" cy="17.3" r=".9" fill="currentColor" stroke="none"/></svg>
+          <div class="scan-error-copy">
+            <strong>Last scan failed</strong>
+            <span id="scan-error-text"></span>
+          </div>
+          <button class="btn ghost small" type="button" id="scan-retry">Try again</button>
+        </div>
         <div class="scan-diff" id="scan-diff" hidden></div>
         <div class="collectors" id="collectors" aria-label="Discovery sources"></div>
+      </section>
+
+      <section class="trust-guide" id="trust-guide" aria-labelledby="trust-guide-title" hidden>
+        <div class="trust-guide-head">
+          <div>
+            <h2 id="trust-guide-title">What do trust levels mean?</h2>
+            <p>Trust only changes how lanwatch reports changes. It never blocks a device.</p>
+          </div>
+          <button class="icon-btn" type="button" id="trust-guide-close" aria-label="Dismiss trust explanation" title="Dismiss">×</button>
+        </div>
+        <div class="trust-guide-grid">
+          <div class="trust-card unknown">
+            <span class="badge unknown">Unknown</span>
+            <p>Seen on the network but not reviewed yet. New devices start here.</p>
+          </div>
+          <div class="trust-card trusted">
+            <span class="badge trusted">Trusted</span>
+            <p>Gear you recognize. If it goes offline, the change is highlighted as a warning.</p>
+          </div>
+          <div class="trust-card ignored">
+            <span class="badge ignored">Ignored</span>
+            <p>Kept in the inventory, but left out of change events and alerts.</p>
+          </div>
+        </div>
+        <div class="trust-guide-foot">
+          <span>Change trust in any device's details. Everything stays on this device.</span>
+          <button class="btn ghost small" type="button" id="trust-guide-done">Got it</button>
+        </div>
       </section>
 
       <section class="events-panel" id="events-panel" aria-labelledby="events-panel-title">
@@ -127,7 +163,7 @@
                 <path d="M20 7v5h-5"/><path d="M4 17v-5h5"/><path d="M6.1 9a7 7 0 0 1 11.7-2L20 9M4 15l2.2 2a7 7 0 0 0 11.7-2"/>
               </svg>
             </button>
-            <button class="btn ghost small" id="events-view-all" type="button">View all</button>
+            <button class="btn ghost small" id="events-view-all" type="button" title="Open the full event log">View all events</button>
           </div>
         </div>
         <div class="event-filters">
@@ -141,8 +177,8 @@
             <option value="">All devices</option>
           </select>
         </div>
-        <ul class="event-list event-list-panel" id="events-panel-list"></ul>
-        <div class="event-status" id="events-panel-status" hidden></div>
+        <ul class="event-list event-list-panel" id="events-panel-list" aria-label="Recent events"></ul>
+        <div class="event-status" id="events-panel-status" role="status" aria-live="polite" hidden></div>
         <p class="event-panel-hint" id="events-panel-hint"></p>
       </section>
 
@@ -157,12 +193,13 @@
           </div>
           <div class="toolbar-right">
             <label class="check"><input type="checkbox" id="show-offline" checked><span>Offline</span></label>
-            <select id="trust-filter" aria-label="Filter by trust">
+            <select id="trust-filter" aria-label="Filter by trust" title="Filter devices by trust level">
               <option value="all">All trust</option>
               <option value="trusted">Trusted</option>
               <option value="unknown">Unknown</option>
               <option value="ignored">Ignored</option>
             </select>
+            <button class="btn ghost icon-only trust-help" id="trust-help" type="button" aria-label="About trust levels" title="About trust levels">?</button>
             <span class="sep" aria-hidden="true"></span>
             <label class="check"><input type="checkbox" id="auto-scan"><span>Auto</span></label>
             <select id="auto-interval" aria-label="Auto-scan interval">
@@ -243,6 +280,7 @@
 
     <footer class="foot">
       <span>lanwatch <span id="version">0.1.0</span></span>
+      <span class="local-chip" title="Inventory, scan history, events and settings stay on this device. Nothing is uploaded.">local only</span>
       <span id="foot-host"></span>
       <span class="mono" id="state-path"></span>
     </footer>
@@ -269,11 +307,12 @@
         </label>
         <label class="field">
           <span>Trust</span>
-          <select id="drawer-trust">
+          <select id="drawer-trust" aria-describedby="drawer-trust-help">
             <option value="trusted">Trusted</option>
             <option value="unknown">Unknown</option>
             <option value="ignored">Ignored</option>
           </select>
+          <small class="field-hint" id="drawer-trust-help"></small>
         </label>
         <dl class="kv" id="drawer-identity"></dl>
       </section>
@@ -298,9 +337,9 @@
         <textarea id="drawer-notes" rows="3" maxlength="500" placeholder="Optional notes…"></textarea>
       </section>
       <section class="drawer-actions">
-        <button class="btn primary" id="drawer-save">Save</button>
+        <button class="btn primary" id="drawer-save">Save changes</button>
         <button class="btn ghost" id="drawer-probe">Probe now</button>
-        <button class="btn ghost danger-text" id="drawer-forget">Forget</button>
+        <button class="btn ghost danger-text" id="drawer-forget">Forget device</button>
       </section>
     </div>
   </aside>
@@ -325,8 +364,8 @@
         <button class="btn ghost small" type="button" id="events-refresh-modal" aria-label="Refresh events" title="Refresh events">Refresh</button>
         <button class="btn ghost small" type="button" id="events-mark-read">Mark all read</button>
       </div>
-      <ul class="event-list" id="event-list"></ul>
-      <div class="event-status" id="event-status" hidden></div>
+      <ul class="event-list" id="event-list" aria-label="All events"></ul>
+      <div class="event-status" id="event-status" role="status" aria-live="polite" hidden></div>
       <p class="dialog-note" id="event-hint"></p>
     </div>
     <div class="dialog-actions">
@@ -335,10 +374,10 @@
     </div>
   </dialog>
 
-  <dialog class="dialog" id="settings">
+  <dialog class="dialog" id="settings" aria-labelledby="settings-title">
     <form id="settings-form">
       <div class="dialog-head">
-        <h2>Scan settings</h2>
+        <h2 id="settings-title">Scan settings</h2>
         <button class="icon-btn" type="button" id="settings-close" aria-label="Close settings">×</button>
       </div>
       <div class="dialog-body">
@@ -370,6 +409,7 @@
           </div>
         </details>
         <p class="dialog-note">One scan probes at most one subnet. Passive discovery (mDNS/SSDP) may be filtered on Android devices.</p>
+        <p class="dialog-note local-note"><strong>Private by default.</strong> Inventory, history, events and settings stay on this device. lanwatch does not upload data or contact external services.</p>
       </div>
       <div class="dialog-actions">
         <button class="btn ghost" type="button" id="settings-cancel">Cancel</button>
