@@ -394,6 +394,10 @@ class WebTests(unittest.TestCase):
             "function topologyMatchesSearch",
             "function topologyMatchesFilter",
             "function topologyNodeDisplayState",
+            "function topologyNameLines",
+            "function topologyTreeColumns",
+            "function topologyNodeLabelMetrics",
+            "function topologyHubLabelMetrics",
             "function topologyZoomScale",
             "function topologyPanView",
             "function topologyTransform",
@@ -423,6 +427,8 @@ class WebTests(unittest.TestCase):
             ".topology-node.trust-ignored",
             ".topology-status-dot.offline",
             ".topology-node.is-selected",
+            ".topology-node.is-selected .topology-node-name",
+            ".topology-link.is-selected",
             ".topology-node.is-dimmed",
             ".topology-node.is-filtered",
             ".topology-search",
@@ -465,14 +471,17 @@ class WebTests(unittest.TestCase):
         status, _, body = self.request("/static/styles.css")
         self.assertEqual(status, 200)
         css = body.decode()
-        self.assertIn("touch-action: none", css)
+        self.assertIn(".topology-svg-host { display: block; touch-action: pan-y; cursor: grab; }", css)
         self.assertIn("@media (pointer: coarse)", css)
         self.assertIn(".topology-control { min-width: 40px; height: 38px; }", css)
         self.assertIn(
             ".topology-filters .filter-chip { min-height: 38px; padding: 0 12px; }",
             css,
         )
-        self.assertIn(".topology-zoom { top: 6px; right: 8px; flex-direction: column; }", css)
+        self.assertIn(
+            ".topology-zoom {\n    position: static;\n    width: max-content;\n    max-width: 100%;\n    margin: 6px 8px 0 auto;\n    flex-direction: row;\n  }",
+            css,
+        )
         self.assertIn("grid-template-columns: repeat(3, minmax(0, 1fr));", css)
         self.assertIn("prefers-reduced-motion: reduce", css)
 

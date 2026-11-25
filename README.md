@@ -121,13 +121,17 @@ MAC (same CIDR with a different gateway MAC is a different network).
   sorting, and search.
 - Network switcher with per-network inventories (see [Networks](#networks)).
 - Device kind icons, confidence, and the evidence behind each guess.
-- Network topology: a gateway-centered logical map of the active network with
-  device kind, online state, and trust cues. Select a device to open the normal
-  device drawer, or select the gateway for network details. The map includes
-  topology-only search, online/offline/trust filters, zoom and fit controls,
-  pointer/touch panning, hover/focus summaries, and keyboard-focusable nodes.
-  Connecting lines are logical visualization links, not confirmed switches,
-  access points, or cabling. Use the device list below for a non-map view.
+- Network topology: a compact, gateway-centered logical map of the active
+  network with distinct device-kind icons, online state, and trust cues. Layout
+  and label wrapping adapt to device count and phone/tablet/desktop widths, and
+  an unhelpful HTTP-status gateway name falls back to “Gateway” while keeping
+  the IP visible. Select a device to highlight its gateway link and open the
+  normal device drawer, or select the gateway for network details. The map
+  includes topology-only search, online/offline/trust filters, zoom and fit
+  controls, pointer/touch panning (vertical swipes still scroll the page),
+  hover/focus summaries, and keyboard-focusable nodes. Connecting lines are
+  logical visualization links, not confirmed switches, access points, or
+  cabling. Use the device list below for a non-map view.
 - Device drawer: rename, set trust, add notes, run an on-demand port probe,
   forget (with confirmation).
 - Scan comparison summary: plain-language counts for new, back-online,

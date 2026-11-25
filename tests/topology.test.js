@@ -494,6 +494,16 @@ function testLargeNetworksAreCappedAndStable() {
     toggled.nodes.map(({ x, y }) => [x, y]),
   );
   assert.notStrictEqual(first.nodes[0].online, toggled.nodes[0].online);
+
+  const statusChanged = devices.map((entry, index) => (
+    index === 1 ? { ...entry, trust: 'trusted', rtt_ms: 987 } : entry
+  ));
+  const stable = build(statusChanged, { width: 800 });
+  assert.deepStrictEqual(
+    first.nodes.map(({ x, y }) => [x, y]),
+    stable.nodes.map(({ x, y }) => [x, y]),
+  );
+  assert.strictEqual(stable.nodes[0].trust, 'trusted');
 }
 
 function testNetworkSwitchingUsesOnlyCurrentDevices() {
@@ -817,13 +827,33 @@ function testZoomPanAndFitLimits() {
   app.onTopologyPanMove({
     pointerId: 7,
     clientX: 40,
-    clientY: 50,
+    clientY: 15,
     preventDefault() {},
   });
   assert.strictEqual(dashboardValue('state.topology.view.x'), 30);
-  assert.strictEqual(dashboardValue('state.topology.view.y'), 40);
+  assert.strictEqual(dashboardValue('state.topology.view.y'), 5);
   app.onTopologyPanEnd({ pointerId: 7 });
   assert.strictEqual(dashboardValue('state.topology.pan'), null);
+  assert.ok(!map.classList.contains('is-panning'));
+
+  app.onTopologyPanStart({
+    target: new FakeElement(null, 'svg'),
+    pointerId: 8,
+    pointerType: 'touch',
+    button: 0,
+    clientX: 10,
+    clientY: 10,
+    preventDefault() {},
+  });
+  app.onTopologyPanMove({
+    pointerId: 8,
+    clientX: 12,
+    clientY: 70,
+    preventDefault() {},
+  });
+  assert.strictEqual(dashboardValue('state.topology.pan'), null);
+  assert.strictEqual(dashboardValue('state.topology.view.x'), 30);
+  assert.strictEqual(dashboardValue('state.topology.view.y'), 5);
   assert.ok(!map.classList.contains('is-panning'));
 }
 
@@ -850,6 +880,10 @@ function testKeyboardAndScreenReaderControls() {
   assert.ok(node.getAttribute('aria-label').includes('Trusted trust'));
   assert.ok(classes(node).includes('is-selected'));
   assert.strictEqual(node.getAttribute('aria-current'), 'true');
+  const link = byClass(svg, 'topology-link')
+    .find((line) => line.getAttribute('data-ip') === '10.0.0.2');
+  assert.ok(link);
+  assert.ok(classes(link).includes('is-selected'));
 }
 
 function testVeryLargeNetworksStayBounded() {
@@ -969,6 +1003,255 @@ function testTopologyNetworkChangeResetsTransientStateAndNodes() {
   assert.ok(!ips.some((ip) => ip.startsWith('10.0.0.')));
 }
 
+function testCompactSmallNetworkLayout() {
+  const names = [
+    'Home Router',
+    'Living Room Television',
+    'Office Laser Printer',
+    'Kitchen Speaker',
+    'Bedroom Phone',
+    'Work Laptop',
+    'Media Console',
+    'Front Door Camera',
+    'Garage Sensor',
+    'Guest Tablet',
+    'Study Desktop',
+    'Hallway Display',
+  ];
+  [320, 360, 390, 430].forEach((width) => {
+    const devices = names.map((name, index) => device(
+      index === 0 ? '10.0.0.1' : `10.0.0.${index + 1}`,
+      index === 0
+        ? { name, kind: 'router', is_gateway: true }
+        : { name, kind: index % 2 ? 'computer' : 'phone' },
+    ));
+    const view = build(devices, {
+      width,
+      network: network('10.0.0.1'),
+      activeNetwork: network('10.0.0.1'),
+    });
+    assert.strictEqual(view.mode, 'tree');
+    assert.strictEqual(view.nodes.length, 11);
+    assert.strictEqual(view.columns, 3);
+    assertNoOverlap(view.nodes);
+    assert.ok(view.height <= 480, `height ${view.height} at ${width}px`);
+    assert.ok(
+      view.nodes[0].y - view.hub.y < 120,
+      `oversized gateway gap at ${width}px`,
+    );
+    const rows = new Set(view.nodes.map((node) => node.y));
+    assert.ok(rows.size <= 4, `${rows.size} rows at ${width}px`);
+    view.nodes.forEach((node) => {
+      assert.ok(node.nameLines.length <= 2);
+      node.nameLines.forEach((line) => {
+        assert.ok(line.length <= view.nameLimit);
+      });
+      assert.ok(node.x - node.r >= 0);
+      assert.ok(node.x + node.r <= width);
+    });
+  });
+
+  const small = build([
+    device('10.0.0.1', { name: 'Router', is_gateway: true }),
+    device('10.0.0.2', { name: 'Laptop', kind: 'computer' }),
+    device('10.0.0.3', { name: 'Phone', kind: 'phone' }),
+  ], {
+    width: 320,
+    network: network('10.0.0.1'),
+    activeNetwork: network('10.0.0.1'),
+  });
+  assert.ok(small.height <= 240, `small network height ${small.height}`);
+  assert.strictEqual(small.nodes[0].y, small.nodes[1].y);
+}
+
+function testResponsiveLayoutBounds() {
+  const widths = [320, 360, 390, 430, 600, 768, 899, 900, 960, 1280];
+  const counts = [0, 1, 2, 3, 6, 11, 20, 40];
+  widths.forEach((width) => {
+    counts.forEach((count) => {
+      const devices = [];
+      if (count > 0) {
+        devices.push(device('10.0.0.1', {
+          name: 'Gateway',
+          kind: 'router',
+          is_gateway: true,
+        }));
+        for (let index = 1; index < count; index += 1) {
+          devices.push(device(`10.0.0.${index + 1}`, {
+            name: index % 3 === 0
+              ? 'A very long device name for wrapping'
+              : `Device ${index}`,
+            kind: index % 2 ? 'computer' : 'phone',
+          }));
+        }
+      }
+      const view = build(devices, {
+        width,
+        network: network('10.0.0.1'),
+        activeNetwork: network('10.0.0.1'),
+      });
+      assert.ok(view.width <= 960);
+      if (count === 0) {
+        assert.strictEqual(view.hub, null);
+      } else {
+        assert.ok(view.hub);
+        assert.ok(view.hub.x - view.hub.r >= 0);
+        assert.ok(view.hub.x + view.hub.r <= view.width);
+        assert.ok(view.hub.y - view.hub.r >= 0);
+        assert.ok(view.hub.y + view.hub.r <= view.height);
+        assert.ok(view.hub.nameLines.length <= 2);
+        view.hub.nameLines.forEach((line) => assert.ok(line.length <= 24));
+      }
+      view.nodes.forEach((node, index) => {
+        assert.ok(node.x - node.r >= 0, `node ${index} left overflow at ${width}px`);
+        assert.ok(node.x + node.r <= view.width, `node ${index} right overflow at ${width}px`);
+        assert.ok(node.y - node.r >= 0, `node ${index} top overflow at ${width}px`);
+        assert.ok(node.y + node.r <= view.height, `node ${index} bottom overflow at ${width}px`);
+        assert.ok(node.nameLines.length <= (view.mode === 'tree' ? 2 : 1));
+        node.nameLines.forEach((line) => {
+          assert.ok(line.length <= view.nameLimit);
+        });
+      });
+      view.links.forEach((link) => {
+        assert.ok(link.x1 >= 0 && link.x1 <= view.width);
+        assert.ok(link.x2 >= 0 && link.x2 <= view.width);
+        assert.ok(link.y1 >= 0 && link.y1 <= view.height);
+        assert.ok(link.y2 >= 0 && link.y2 <= view.height);
+      });
+      assert.strictEqual(
+        view.columns,
+        view.mode === 'tree' ? app.topologyTreeColumns(view.nodes.length) : 0,
+      );
+    });
+  });
+}
+
+function testGatewayNameFallbackAndWrapping() {
+  const statusDevices = [
+    device('192.168.1.1', {
+      name: '302 Moved Temporarily',
+      kind: 'router',
+      is_gateway: true,
+    }),
+    device('192.168.1.2', { name: 'Laptop' }),
+  ];
+  const statusView = build(statusDevices, {
+    network: network('192.168.1.1'),
+    activeNetwork: network('192.168.1.1'),
+  });
+  assert.strictEqual(statusView.hub.name, 'Gateway');
+  assert.strictEqual(statusView.hub.nameLines.join('|'), 'Gateway');
+  const statusSvg = app.createTopologySvg(documentStub, statusView);
+  const statusText = allText(statusSvg);
+  assert.ok(!statusText.includes('302 Moved Temporarily'));
+  assert.ok(statusText.includes('192.168.1.1'));
+  assert.ok(statusText.includes('GATEWAY'));
+  assert.ok(!statusText.includes('Gateway Gateway'));
+
+  const bandwidthView = build([
+    device('192.168.1.1', {
+      name: '500 Mbps Router',
+      kind: 'router',
+      is_gateway: true,
+    }),
+    device('192.168.1.2', { name: 'Laptop' }),
+  ], {
+    network: network('192.168.1.1'),
+    activeNetwork: network('192.168.1.1'),
+  });
+  assert.strictEqual(bandwidthView.hub.name, '500 Mbps Router');
+  assert.strictEqual(bandwidthView.hub.showName, true);
+
+  const longHost = 'very-long-living-room-router.example.lan';
+  const longDevices = [
+    device('192.168.1.1', {
+      name: longHost,
+      hostname: longHost,
+      kind: 'router',
+      is_gateway: true,
+    }),
+    device('192.168.1.2', { name: 'Laptop' }),
+  ];
+  const longView = build(longDevices, {
+    network: network('192.168.1.1'),
+    activeNetwork: network('192.168.1.1'),
+    width: 320,
+  });
+  assert.strictEqual(longView.hub.name, longHost);
+  assert.strictEqual(longView.hub.nameLines.length, 2);
+  longView.hub.nameLines.forEach((line) => assert.ok(line.length <= 24));
+  const longSvg = app.createTopologySvg(documentStub, longView);
+  const longText = allText(longSvg);
+  assert.ok(longText.includes('192.168.1.1'));
+  assert.ok(longText.includes(longHost));
+  assert.strictEqual(byClass(longSvg, 'topology-hub-name').length, 2);
+}
+
+function testDeviceIconsUseDistinctExistingKinds() {
+  const required = ['computer', 'phone', 'tv', 'media', 'printer', 'iot', 'device'];
+  const bodies = required.map((kind) => app.topologyIconBody(kind));
+  assert.strictEqual(new Set(bodies).size, required.length);
+  assert.strictEqual(app.topologyIconBody('mobile'), app.topologyIconBody('phone'));
+  assert.strictEqual(app.topologyIconBody('tablet'), app.topologyIconBody('phone'));
+  assert.strictEqual(app.topologyIconBody('unknown'), app.topologyIconBody('device'));
+  assert.strictEqual(app.topologyIconBody('gateway'), app.topologyIconBody('router'));
+
+  const devices = [device('10.0.0.1', { is_gateway: true })];
+  required.forEach((kind, index) => {
+    devices.push(device(`10.0.0.${index + 2}`, {
+      name: `${kind} node`,
+      kind,
+    }));
+  });
+  const view = build(devices, {
+    network: network('10.0.0.1'),
+    activeNetwork: network('10.0.0.1'),
+  });
+  const svg = app.createTopologySvg(documentStub, view);
+  const iconBodies = byClass(svg, 'topology-kind-icon')
+    .slice(1)
+    .map((element) => element.innerHTML);
+  assert.strictEqual(new Set(iconBodies).size, required.length);
+}
+
+function testSelectedDeviceHighlightsConnection() {
+  resetTopologyState();
+  const devices = [
+    device('10.0.0.1', { name: 'Router', is_gateway: true }),
+    device('10.0.0.2', { name: 'Laptop', trust: 'trusted' }),
+    device('10.0.0.3', { name: 'Printer', trust: 'ignored' }),
+  ];
+  const view = build(devices, {
+    network: network('10.0.0.1'),
+    activeNetwork: network('10.0.0.1'),
+  });
+  const svg = app.createTopologySvg(documentStub, view, {
+    selected: { kind: 'device', ip: '10.0.0.2' },
+  });
+  const links = byClass(svg, 'topology-link');
+  const selectedLink = links.find((line) => line.getAttribute('data-ip') === '10.0.0.2');
+  const otherLink = links.find((line) => line.getAttribute('data-ip') === '10.0.0.3');
+  assert.ok(classes(selectedLink).includes('is-selected'));
+  assert.ok(!classes(otherLink).includes('is-selected'));
+  const node = byClass(svg, 'topology-node')
+    .find((item) => item.getAttribute('data-ip') === '10.0.0.2');
+  assert.ok(classes(node).includes('is-selected'));
+  assert.strictEqual(node.getAttribute('aria-current'), 'true');
+
+  setTopologyModel(view);
+  const host = documentStub.querySelector('#topology-svg-host');
+  host.replaceChildren(svg);
+  vm.runInContext(
+    "state.topology.selected = { kind: 'device', ip: '10.0.0.3' }",
+    app,
+  );
+  app.syncTopologySelection();
+  const nextLink = links.find((line) => line.getAttribute('data-ip') === '10.0.0.3');
+  assert.ok(classes(nextLink).includes('is-selected'));
+  assert.ok(!classes(selectedLink).includes('is-selected'));
+  assert.ok(!classes(node).includes('is-selected'));
+}
+
 function testGatewaySelectionUsesSafeTextForUntrustedData() {
   resetTopologyState();
   const payload = '<svg onload=alert(1)>&hostile</svg>';
@@ -1014,6 +1297,11 @@ const tests = [
   testTopologySkipsRedundantRenders,
   testTopologyRendersPreserveKeyboardFocus,
   testTopologyNetworkChangeResetsTransientStateAndNodes,
+  testCompactSmallNetworkLayout,
+  testResponsiveLayoutBounds,
+  testGatewayNameFallbackAndWrapping,
+  testDeviceIconsUseDistinctExistingKinds,
+  testSelectedDeviceHighlightsConnection,
   testGatewaySelectionUsesSafeTextForUntrustedData,
 ];
 

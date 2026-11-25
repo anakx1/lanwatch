@@ -46,7 +46,17 @@ const ICONS = {
     '<rect x="6" y="6" width="12" height="12" rx="2.5"/><path d="M9.5 2.5v3M14.5 2.5v3M9.5 18.5v3M14.5 18.5v3M2.5 9.5h3M2.5 14.5h3M18.5 9.5h3M18.5 14.5h3"/>',
 };
 
-const ICON_ALIASES = { self: 'computer', '': 'device' };
+const ICON_ALIASES = {
+  self: 'computer',
+  '': 'device',
+  unknown: 'device',
+  mobile: 'phone',
+  tablet: 'phone',
+  smartphone: 'phone',
+  media_player: 'media',
+  gateway: 'router',
+  network: 'router',
+};
 const CHEVRON =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>';
 
@@ -269,13 +279,33 @@ function topologyGateway(devices, network, activeNetwork) {
   return null;
 }
 
-function topologyName(device, ip) {
-  if (!device) return 'Gateway';
-  const values = [device.label, device.hostname, device.name];
-  for (const value of values) {
+const TOPOLOGY_HTTP_STATUS_REASON = /^(?:continue|switching protocols|ok|created|accepted|non-authoritative information|no content|reset content|partial content|multiple choices|moved permanently|moved temporarily|found|see other|not modified|use proxy|temporary redirect|permanent redirect|bad request|unauthorized|payment required|forbidden|not found|method not allowed|not acceptable|proxy authentication required|request timeout|conflict|gone|length required|precondition failed|payload too large|uri too long|unsupported media type|range not satisfiable|expectation failed|i'?m a teapot|misdirected request|unprocessable entity|locked|failed dependency|too early|upgrade required|precondition required|too many requests|request header fields too large|unavailable for legal reasons|internal server error|not implemented|bad gateway|service unavailable|gateway timeout|http version not supported|variant also negotiates|insufficient storage|loop detected|not extended|network authentication required|redirect(?:ed)?|temporarily unavailable)$/i;
+
+function topologyIsGenericHttpStatusName(value) {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim();
+  if (!text) return false;
+  if (TOPOLOGY_HTTP_STATUS_REASON.test(text)) return true;
+  const match = text.match(/^(?:http\s*)?[1-5]\d{2}(?:\s+(.*))?$/i);
+  if (!match) return false;
+  const reason = String(match[1] || '').trim();
+  return !reason || TOPOLOGY_HTTP_STATUS_REASON.test(reason);
+}
+
+function topologyName(device, ip, options = {}) {
+  if (!device) return options.gateway ? 'Gateway' : String(ip || 'Unknown device');
+  const candidates = [
+    [device.label, true],
+    [device.name, false],
+    [device.hostname, true],
+    [device.nbns_name, true],
+  ];
+  for (const [value, explicit] of candidates) {
     const text = String(value ?? '').trim();
-    if (text) return text;
+    if (!text) continue;
+    if (options.gateway && !explicit && topologyIsGenericHttpStatusName(text)) continue;
+    return text;
   }
+  if (options.gateway) return 'Gateway';
   return String(ip || device.ip || 'Unknown device');
 }
 
@@ -396,16 +426,118 @@ function truncateTopologyText(value, max) {
   return `${chars.slice(0, Math.max(1, limit - 1)).join('')}…`;
 }
 
-function topologyTreeLayout(count, width) {
-  const margin = 18;
-  const columns = width < 470 ? 2 : 3;
-  const rowHeight = 82;
-  const hub = { x: width / 2, y: 52, r: 34 };
-  const startY = hub.y + hub.r + 90;
+function topologyNameLines(value, maxChars, maxLines = 2) {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim();
+  if (!text) return [''];
+  const limit = Math.max(4, Math.floor(Number(maxChars) || 12));
+  const lineLimit = Math.max(1, Math.floor(Number(maxLines) || 1));
+  const splitWord = (word) => {
+    if (word.length <= limit) return [word];
+    const parts = [];
+    let rest = word;
+    while (rest.length > limit) {
+      let cut = rest.lastIndexOf('-', limit - 1);
+      if (cut >= Math.floor(limit * 0.5)) cut += 1;
+      else cut = limit;
+      parts.push(rest.slice(0, cut));
+      rest = rest.slice(cut);
+    }
+    if (rest) parts.push(rest);
+    return parts;
+  };
+  const words = text.split(' ').flatMap(splitWord);
+  const lines = [];
+  let current = '';
+  words.forEach((word) => {
+    if (!current) {
+      current = word;
+    } else if (`${current} ${word}`.length <= limit) {
+      current = `${current} ${word}`;
+    } else {
+      lines.push(current);
+      current = word;
+    }
+  });
+  if (current) lines.push(current);
+  if (lines.length <= lineLimit) return lines;
+  const kept = lines.slice(0, lineLimit);
+  const remainder = lines.slice(lineLimit).join(' ');
+  kept[lineLimit - 1] = truncateTopologyText(
+    `${kept[lineLimit - 1]} ${remainder}`.trim(),
+    limit,
+  );
+  return kept;
+}
+
+function topologyNodeLabelMetrics(nodeRadius, lineCount) {
+  const radius = Math.max(0, Number(nodeRadius) || 18);
+  const lines = Math.max(1, Math.min(2, Math.floor(Number(lineCount) || 1)));
+  const lineHeight = 10.5;
+  const nameY = radius + 14;
+  const ipY = nameY + lines * lineHeight + 1.5;
+  return { lineCount: lines, lineHeight, nameY, ipY, bottom: ipY + 3 };
+}
+
+function topologyHubLabelMetrics(hubRadius, lineCount, missing) {
+  const radius = Math.max(0, Number(hubRadius) || 30);
+  const lines = Math.max(0, Math.min(2, Math.floor(Number(lineCount) || 0)));
+  const lineHeight = 10.5;
+  const kickerY = radius + 13;
+  const nameY = radius + 25;
+  const ipY = lines > 0 ? nameY + lines * lineHeight + 1.5 : radius + 27;
+  const missingY = ipY + 12;
+  return {
+    lineCount: lines,
+    lineHeight,
+    kickerY,
+    nameY,
+    ipY,
+    missingY,
+    bottom: (missing ? missingY : ipY) + 3,
+  };
+}
+
+function topologyTreeColumns(count) {
+  const safeCount = Math.max(0, Math.floor(Number(count) || 0));
+  if (safeCount <= 1) return 1;
+  if (safeCount === 2) return 2;
+  return 3;
+}
+
+function topologyNameLimit(width, columns, mode) {
+  if (mode === 'radial') return 20;
+  const safeWidth = Math.max(1, Number(width) || 720);
+  const safeColumns = Math.max(1, Math.floor(Number(columns) || 1));
+  const margin = safeWidth < 360 ? 12 : 16;
+  const columnWidth = Math.max(1, (safeWidth - margin * 2) / safeColumns);
+  return Math.max(10, Math.min(24, Math.floor((columnWidth - 10) / 5.9)));
+}
+
+function topologyHubNameLimit() {
+  return 24;
+}
+
+function topologyTreeLayout(count, width, metrics = {}) {
+  const margin = width < 360 ? 12 : 16;
+  const columns = topologyTreeColumns(count);
+  const nodeRadius = width < 360 ? 17 : 18;
+  const labelMetrics = topologyNodeLabelMetrics(nodeRadius, metrics.lineCount);
+  const rowHeight = Math.max(70, labelMetrics.bottom + nodeRadius + 6);
+  const hubRadius = width < 360 ? 28 : 30;
+  const hubY = width < 360 ? 38 : 40;
+  const hubMetrics = topologyHubLabelMetrics(
+    hubRadius,
+    Math.max(0, Number(metrics.hubLineCount) || 0),
+    !!metrics.hubMissing,
+  );
+  const startY = Math.max(
+    hubY + hubRadius + 54,
+    hubY + hubMetrics.bottom + nodeRadius + 10,
+  );
   const rows = Math.max(1, Math.ceil(count / columns));
-  const nodeRadius = 18;
   const contentWidth = width - margin * 2;
   const columnWidth = contentWidth / columns;
+  const hub = { x: width / 2, y: hubY, r: hubRadius };
   const nodes = [];
   for (let index = 0; index < count; index += 1) {
     const col = index % columns;
@@ -420,14 +552,16 @@ function topologyTreeLayout(count, width) {
     });
   }
   const height = count === 0
-    ? 230
-    : startY + (rows - 1) * rowHeight + nodeRadius + 52;
+    ? 200
+    : startY + (rows - 1) * rowHeight + labelMetrics.bottom + 10;
   return {
     mode: 'tree',
     width,
-    height: Math.max(250, Math.round(height)),
+    height: Math.max(200, Math.round(height)),
     hub,
     nodes,
+    columns,
+    rowHeight,
   };
 }
 
@@ -484,11 +618,11 @@ function topologyRadialLayout(count, width) {
   };
 }
 
-function topologyLayout(count, width) {
+function topologyLayout(count, width, metrics = {}) {
   const safeWidth = Math.max(280, Math.min(Number(width) || 720, 960));
   const safeCount = Math.max(0, Math.floor(Number(count) || 0));
   return safeWidth < 900
-    ? topologyTreeLayout(safeCount, safeWidth)
+    ? topologyTreeLayout(safeCount, safeWidth, metrics)
     : topologyRadialLayout(safeCount, safeWidth);
 }
 
@@ -523,8 +657,6 @@ function buildTopologyView({
     ? sorted.filter((device) => String(device.ip) !== gateway.ip)
     : [];
   const shown = children.slice(0, limit);
-  const layout = topologyLayout(gateway ? shown.length : 0, safeWidth);
-  const nameLimit = safeWidth < 560 ? 15 : safeWidth < 900 ? 18 : 20;
   const networkLabel = String(
     (activeNetwork && (activeNetwork.label || activeNetwork.title))
     || (network && (network.label || network.title))
@@ -542,9 +674,41 @@ function buildTopologyView({
     || '',
   );
 
+  const layoutMode = safeWidth < 900 ? 'tree' : 'radial';
+  const columns = layoutMode === 'tree' ? topologyTreeColumns(shown.length) : 0;
+  const nameLimit = topologyNameLimit(safeWidth, columns, layoutMode);
+  const gatewayDevice = gateway && gateway.device ? gateway.device : null;
+  const gatewayTrust = gatewayDevice ? topologyTrust(gatewayDevice) : 'unknown';
+  const gatewayMac = networkGatewayMac || String((gatewayDevice && gatewayDevice.mac) || '');
+  const hubName = gatewayDevice
+    ? topologyName(gatewayDevice, gateway.ip, { gateway: true })
+    : 'Gateway';
+  const hubNameLines = topologyNameLines(hubName, topologyHubNameLimit(), 2);
+  const hubShowName = !!(
+    gatewayDevice
+    && hubName
+    && hubName !== gateway.ip
+    && hubName !== 'Gateway'
+  );
+  const nodeNames = shown.map((device) => topologyName(device, device.ip));
+  const nodeNameLines = nodeNames.map((name) => topologyNameLines(
+    name,
+    nameLimit,
+    layoutMode === 'tree' ? 2 : 1,
+  ));
+  const maxNameLines = nodeNameLines.reduce(
+    (max, lines) => Math.max(max, lines.length),
+    1,
+  );
+  const layout = topologyLayout(gateway ? shown.length : 0, safeWidth, {
+    lineCount: maxNameLines,
+    hubLineCount: hubShowName ? hubNameLines.length : 0,
+    hubMissing: !!(gateway && gateway.missing),
+  });
+
   const nodes = shown.map((device, index) => {
     const position = layout.nodes[index] || { x: layout.hub.x, y: layout.hub.y, r: 18 };
-    const name = topologyName(device, device.ip);
+    const name = nodeNames[index];
     const trust = topologyTrust(device);
     const kind = device.kind || 'device';
     return {
@@ -554,6 +718,7 @@ function buildTopologyView({
       label: String(device.label || ''),
       vendor: String(device.vendor || ''),
       shortName: truncateTopologyText(name, nameLimit),
+      nameLines: nodeNameLines[index],
       kind,
       kindLabel: topologyKindLabel(kind),
       online: !!device.online,
@@ -582,12 +747,11 @@ function buildTopologyView({
     };
   }
 
-  const gatewayDevice = gateway && gateway.device ? gateway.device : null;
-  const gatewayTrust = gatewayDevice ? topologyTrust(gatewayDevice) : 'unknown';
-  const gatewayMac = networkGatewayMac || String((gatewayDevice && gatewayDevice.mac) || '');
   const hub = gateway && list.length ? {
     ip: gateway.ip,
-    name: gatewayDevice ? topologyName(gatewayDevice, gateway.ip) : 'Gateway',
+    name: hubName,
+    nameLines: hubNameLines,
+    showName: hubShowName,
     hostname: String((gatewayDevice && gatewayDevice.hostname) || ''),
     label: String((gatewayDevice && gatewayDevice.label) || ''),
     vendor: String((gatewayDevice && gatewayDevice.vendor) || ''),
@@ -611,6 +775,9 @@ function buildTopologyView({
     width: layout.width,
     height: layout.height,
     mode: layout.mode,
+    columns,
+    nameLimit,
+    rowHeight: layout.rowHeight || 0,
     hub,
     nodes,
     links: hub ? nodes.map((node) => ({
@@ -706,8 +873,9 @@ function createTopologySvg(doc, view, options = {}) {
     'aria-hidden': 'true',
   });
   view.links.forEach((link) => {
+    const selectedLink = isSelected('device', link.ip);
     links.appendChild(createTopologySvgElement(doc, 'line', {
-      class: `topology-link${link.offline ? ' is-offline' : ''}`,
+      class: `topology-link${link.offline ? ' is-offline' : ''}${selectedLink ? ' is-selected' : ''}`,
       x1: link.x1,
       y1: link.y1,
       x2: link.x2,
@@ -728,8 +896,19 @@ function createTopologySvg(doc, view, options = {}) {
       hub.online === true ? 'is-online' : '',
       selectedHub ? 'is-selected' : '',
     ].filter(Boolean).join(' ');
+    const hubNameLines = Array.isArray(hub.nameLines)
+      ? hub.nameLines
+      : topologyNameLines(hub.name, topologyHubNameLimit(), 2);
+    const showHubName = hub.showName !== false
+      && !!(hub.name && hub.name !== hub.ip && hub.name !== 'Gateway');
+    const hubMetrics = topologyHubLabelMetrics(
+      hub.r,
+      showHubName ? hubNameLines.length : 0,
+      hub.missing,
+    );
+    const hubNameLabel = showHubName ? hub.name : '';
     const hubLabel = [
-      hub.name,
+      hubNameLabel,
       'Gateway',
       `IP ${hub.ip}`,
       hub.statusLabel,
@@ -748,7 +927,11 @@ function createTopologySvg(doc, view, options = {}) {
     });
     if (selectedHub) group.setAttribute('aria-current', 'true');
     const status = hub.missing ? 'gateway not in inventory' : hub.online ? 'online' : 'offline';
-    appendTopologyTitle(doc, group, `Gateway ${hub.name}, ${hub.ip}, ${status}, ${hub.trustLabel}`);
+    appendTopologyTitle(
+      doc,
+      group,
+      `${hubNameLabel ? `${hubNameLabel}, ` : ''}Gateway ${hub.ip}, ${status}, ${hub.trustLabel}`,
+    );
     group.appendChild(createTopologySvgElement(doc, 'circle', {
       class: 'topology-hub-halo',
       r: hub.r + 10,
@@ -770,22 +953,24 @@ function createTopologySvg(doc, view, options = {}) {
     }));
     appendTopologyText(doc, group, 'GATEWAY', {
       class: 'topology-hub-kicker',
-      y: hub.r + 16,
+      y: hubMetrics.kickerY,
     });
-    if (hub.name && hub.name !== hub.ip && hub.name !== 'Gateway') {
-      appendTopologyText(doc, group, truncateTopologyText(hub.name, 18), {
-        class: 'topology-hub-name',
-        y: hub.r + 32,
+    if (showHubName) {
+      hubNameLines.forEach((line, index) => {
+        appendTopologyText(doc, group, line, {
+          class: 'topology-hub-name',
+          y: hubMetrics.nameY + index * hubMetrics.lineHeight,
+        });
       });
     }
     appendTopologyText(doc, group, hub.ip, {
       class: 'topology-hub-ip',
-      y: hub.r + (hub.name && hub.name !== hub.ip && hub.name !== 'Gateway' ? 46 : 32),
+      y: hubMetrics.ipY,
     });
     if (hub.missing) {
       appendTopologyText(doc, group, 'not in inventory', {
         class: 'topology-hub-missing',
-        y: hub.r + 60,
+        y: hubMetrics.missingY,
       });
     }
     viewport.appendChild(group);
@@ -811,7 +996,7 @@ function createTopologySvg(doc, view, options = {}) {
     );
     group.appendChild(createTopologySvgElement(doc, 'circle', {
       class: 'topology-node-halo',
-      r: node.r + 4,
+      r: node.r + 5,
     }));
     group.appendChild(createTopologySvgElement(doc, 'circle', {
       class: 'topology-node-surface',
@@ -824,20 +1009,20 @@ function createTopologySvg(doc, view, options = {}) {
       cy: -node.r * 0.68,
       r: 4,
     }));
-    appendTopologyText(doc, group, node.shortName, {
-      class: 'topology-node-name',
-      y: node.r + 14,
+    const nodeNameLines = Array.isArray(node.nameLines)
+      ? node.nameLines
+      : [node.shortName || node.name];
+    const nodeMetrics = topologyNodeLabelMetrics(node.r, nodeNameLines.length);
+    nodeNameLines.forEach((line, index) => {
+      appendTopologyText(doc, group, line, {
+        class: 'topology-node-name',
+        y: nodeMetrics.nameY + index * nodeMetrics.lineHeight,
+      });
     });
     appendTopologyText(doc, group, node.ip, {
       class: 'topology-node-ip',
-      y: node.r + 26,
+      y: nodeMetrics.ipY,
     });
-    if (!node.online) {
-      appendTopologyText(doc, group, 'offline', {
-        class: 'topology-node-offline',
-        y: node.r + 37,
-      });
-    }
     nodes.appendChild(group);
   });
   viewport.appendChild(nodes);
@@ -869,6 +1054,14 @@ function syncTopologySelection() {
     element.classList.toggle('is-selected', active);
     if (active) element.setAttribute('aria-current', 'true');
     else element.removeAttribute('aria-current');
+  });
+  $$('.topology-link[data-ip]', host).forEach((element) => {
+    const active = !!(
+      selected
+      && selected.kind === 'device'
+      && String(selected.ip || '') === String(element.getAttribute('data-ip') || '')
+    );
+    element.classList.toggle('is-selected', active);
   });
 }
 
@@ -1230,6 +1423,7 @@ function onTopologyPanStart(event) {
   const current = state.topology.view;
   state.topology.pan = {
     id: event.pointerId,
+    pointerType: event.pointerType || 'mouse',
     startX: event.clientX,
     startY: event.clientY,
     originX: current.x,
@@ -1248,7 +1442,7 @@ function onTopologyPanStart(event) {
     }
   }
   hideTopologyTooltip();
-  if (event.preventDefault) event.preventDefault();
+  if (event.pointerType !== 'touch' && event.preventDefault) event.preventDefault();
 }
 
 function onTopologyPanMove(event) {
@@ -1256,8 +1450,15 @@ function onTopologyPanMove(event) {
   if (!pan || event.pointerId !== pan.id) return;
   const dx = event.clientX - pan.startX;
   const dy = event.clientY - pan.startY;
-  if (!pan.moved && Math.hypot(dx, dy) < 3) return;
-  pan.moved = true;
+  if (!pan.moved) {
+    if (Math.hypot(dx, dy) < 3) return;
+    if (pan.pointerType === 'touch' && Math.abs(dy) > Math.abs(dx)) {
+      state.topology.pan = null;
+      releaseTopologyPanCapture($('#topology-map'), event.pointerId);
+      return;
+    }
+    pan.moved = true;
+  }
   const model = state.topology.model;
   if (!model) return;
   state.topology.view = topologyPanView(
@@ -1271,20 +1472,23 @@ function onTopologyPanMove(event) {
   if (event.preventDefault) event.preventDefault();
 }
 
-function onTopologyPanEnd(event) {
-  const pan = state.topology.pan;
-  if (!pan || event.pointerId !== pan.id) return;
-  state.topology.pan = null;
-  const map = $('#topology-map');
+function releaseTopologyPanCapture(map, pointerId) {
   if (!map) return;
   map.classList.remove('is-panning');
-  if (typeof map.hasPointerCapture === 'function' && map.hasPointerCapture(event.pointerId)) {
+  if (typeof map.hasPointerCapture === 'function' && map.hasPointerCapture(pointerId)) {
     try {
-      map.releasePointerCapture(event.pointerId);
+      map.releasePointerCapture(pointerId);
     } catch (error) {
       // The pointer may already have been released by the browser.
     }
   }
+}
+
+function onTopologyPanEnd(event) {
+  const pan = state.topology.pan;
+  if (!pan || event.pointerId !== pan.id) return;
+  state.topology.pan = null;
+  releaseTopologyPanCapture($('#topology-map'), event.pointerId);
 }
 
 function bindTopologyEvents() {
@@ -1660,6 +1864,7 @@ function topologyDeviceSignature(device) {
     device.ip,
     device.name,
     device.hostname,
+    device.nbns_name,
     device.label,
     device.vendor,
     device.kind,
