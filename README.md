@@ -121,6 +121,13 @@ MAC (same CIDR with a different gateway MAC is a different network).
   sorting, and search.
 - Network switcher with per-network inventories (see [Networks](#networks)).
 - Device kind icons, confidence, and the evidence behind each guess.
+- Network topology: a gateway-centered logical map of the active network with
+  device kind, online state, and trust cues. Select a device to open the normal
+  device drawer, or select the gateway for network details. The map includes
+  topology-only search, online/offline/trust filters, zoom and fit controls,
+  pointer/touch panning, hover/focus summaries, and keyboard-focusable nodes.
+  Connecting lines are logical visualization links, not confirmed switches,
+  access points, or cabling. Use the device list below for a non-map view.
 - Device drawer: rename, set trust, add notes, run an on-demand port probe,
   forget (with confirmation).
 - Scan comparison summary: plain-language counts for new, back-online,
@@ -378,12 +385,14 @@ On a normal Linux machine all collectors usually work, with or without root.
 ## Tests and development
 
 ```bash
-python3 -m unittest discover -s tests -t .   # 208 tests
+python3 -m unittest discover -s tests -t .   # 212 tests
 ruff check .
 mypy
 ```
 
-The tests mock the network layer, so they run offline and on Android.
+The tests mock the network layer, so they run offline and on Android. The
+topology frontend checks use Node's built-in `assert` and `vm` modules when
+Node is available, and are skipped otherwise.
 
 Layout:
 

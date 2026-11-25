@@ -78,6 +78,14 @@ const EVENT_ICONS = {
 };
 const PANEL_EVENT_LIMIT = 6;
 const EVENT_SEVERITIES = ['all', 'info', 'warning', 'critical'];
+const TOPOLOGY_NS = 'http://www.w3.org/2000/svg';
+const TOPOLOGY_LIMITS = { phone: 12, tablet: 20, desktop: 32 };
+const TOPOLOGY_FILTERS = ['all', 'online', 'offline', 'trusted', 'unknown', 'ignored'];
+const TOPOLOGY_ZOOM_MIN = 0.6;
+const TOPOLOGY_ZOOM_MAX = 2.4;
+const TOPOLOGY_ZOOM_STEP = 0.2;
+const TOPOLOGY_PAN_SLOP = 96;
+const TOPOLOGY_PAN_SLOP_Y = 72;
 const EVENT_TYPE_LABELS = {
   'device.new': 'New device',
   'device.online': 'Back online',
@@ -116,6 +124,19 @@ const state = {
   autoTimer: null,
   renderQueued: false,
   search: '',
+  topology: {
+    width: 0,
+    frame: 0,
+    model: null,
+    networkId: '',
+    signature: null,
+    search: '',
+    filter: 'all',
+    selected: null,
+    view: { scale: 1, x: 0, y: 0 },
+    pan: null,
+    bound: false,
+  },
   latestDiff: null,
   diffError: null,
   newDevices: new Set(),
@@ -221,6 +242,1080 @@ function ipNumber(ip) {
 
 function plural(count, word) {
   return `${count} ${word}${count === 1 ? '' : 's'}`;
+}
+
+function topologyLimit(width) {
+  const value = Number(width) || 720;
+  if (value < 560) return TOPOLOGY_LIMITS.phone;
+  if (value < 900) return TOPOLOGY_LIMITS.tablet;
+  return TOPOLOGY_LIMITS.desktop;
+}
+
+function topologyGateway(devices, network, activeNetwork) {
+  const list = Array.isArray(devices) ? devices : [];
+  const flagged = list.find((device) => device && device.is_gateway);
+  if (flagged) return { device: flagged, ip: String(flagged.ip || ''), missing: false };
+
+  const candidates = [
+    network && network.gateway,
+    activeNetwork && activeNetwork.gateway,
+  ];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    const ip = String(candidate);
+    const match = list.find((device) => device && String(device.ip) === ip);
+    return { device: match || null, ip, missing: !match };
+  }
+  return null;
+}
+
+function topologyName(device, ip) {
+  if (!device) return 'Gateway';
+  const values = [device.label, device.hostname, device.name];
+  for (const value of values) {
+    const text = String(value ?? '').trim();
+    if (text) return text;
+  }
+  return String(ip || device.ip || 'Unknown device');
+}
+
+function topologyLookup(map, key) {
+  return Object.prototype.hasOwnProperty.call(map, key) ? map[key] : null;
+}
+
+function topologyTrust(device) {
+  const trust = device && device.trust;
+  return topologyLookup(TRUST_LABELS, trust) ? trust : 'unknown';
+}
+
+function topologyKindLabel(kind) {
+  const key = String(kind || 'device');
+  const label = topologyLookup(KIND_LABELS, key);
+  if (label) return label;
+  if (key === 'device') return 'Device';
+  return key.replace(/[_-]+/g, ' ').replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function topologySearchText(node) {
+  if (!node) return '';
+  return [
+    node.name,
+    node.hostname,
+    node.label,
+    node.vendor,
+    node.ip,
+    node.kindLabel,
+    node.networkLabel,
+    node.networkCidr,
+    node.interfaceName,
+    node.mac,
+  ]
+    .filter((value) => value != null && String(value).trim() !== '')
+    .map((value) => String(value).toLowerCase())
+    .join(' ');
+}
+
+function topologyMatchesSearch(node, query) {
+  const tokens = String(query || '').trim().toLowerCase().split(/\s+/).filter(Boolean);
+  if (!tokens.length) return true;
+  const text = topologySearchText(node);
+  return tokens.every((token) => text.includes(token));
+}
+
+function topologyMatchesFilter(node, filter) {
+  if (!node || !filter || filter === 'all') return true;
+  if (filter === 'online') return !!node.online;
+  if (filter === 'offline') return !node.online;
+  if (filter === 'trusted' || filter === 'unknown' || filter === 'ignored') {
+    return node.trust === filter;
+  }
+  return true;
+}
+
+function topologyNodeDisplayState(node, filter, query) {
+  const search = String(query || '').trim();
+  const filterMatch = topologyMatchesFilter(node, filter);
+  const searchMatch = topologyMatchesSearch(node, search);
+  return {
+    filterMatch,
+    searchMatch,
+    filtered: !filterMatch,
+    dimmed: !!search && !searchMatch,
+    matched: !!search && searchMatch,
+  };
+}
+
+function topologyClampScale(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 1;
+  return Math.min(TOPOLOGY_ZOOM_MAX, Math.max(TOPOLOGY_ZOOM_MIN, number));
+}
+
+function topologyZoomScale(scale, direction) {
+  const step = Number(direction) < 0 ? -TOPOLOGY_ZOOM_STEP : TOPOLOGY_ZOOM_STEP;
+  return topologyClampScale(Number(scale || 1) + step);
+}
+
+function topologyFitView() {
+  return { scale: 1, x: 0, y: 0 };
+}
+
+function topologyPanView(view, nextX, nextY, width, height) {
+  const scale = topologyClampScale(view && view.scale);
+  const limitX = Math.max(
+    TOPOLOGY_PAN_SLOP,
+    ((scale - 1) * Math.max(1, Number(width) || 1)) / 2 + TOPOLOGY_PAN_SLOP,
+  );
+  const limitY = Math.max(
+    TOPOLOGY_PAN_SLOP_Y,
+    ((scale - 1) * Math.max(1, Number(height) || 1)) / 2 + TOPOLOGY_PAN_SLOP_Y,
+  );
+  return {
+    scale,
+    x: Math.max(-limitX, Math.min(limitX, Number(nextX) || 0)),
+    y: Math.max(-limitY, Math.min(limitY, Number(nextY) || 0)),
+  };
+}
+
+function topologyTransform(view, model) {
+  const scale = topologyClampScale(view && view.scale);
+  const x = Number(view && view.x) || 0;
+  const y = Number(view && view.y) || 0;
+  const width = Math.max(1, Number(model && model.width) || 720);
+  const height = Math.max(1, Number(model && model.height) || 420);
+  const centerX = width / 2;
+  const centerY = height / 2;
+  const round = (value) => Math.round(value * 1000) / 1000;
+  return `translate(${round(centerX + x)} ${round(centerY + y)}) scale(${round(scale)}) translate(${round(-centerX)} ${round(-centerY)})`;
+}
+
+function truncateTopologyText(value, max) {
+  const chars = Array.from(String(value ?? ''));
+  const limit = Math.max(1, Number(max) || 1);
+  if (chars.length <= limit) return chars.join('');
+  return `${chars.slice(0, Math.max(1, limit - 1)).join('')}…`;
+}
+
+function topologyTreeLayout(count, width) {
+  const margin = 18;
+  const columns = width < 470 ? 2 : 3;
+  const rowHeight = 82;
+  const hub = { x: width / 2, y: 52, r: 34 };
+  const startY = hub.y + hub.r + 90;
+  const rows = Math.max(1, Math.ceil(count / columns));
+  const nodeRadius = 18;
+  const contentWidth = width - margin * 2;
+  const columnWidth = contentWidth / columns;
+  const nodes = [];
+  for (let index = 0; index < count; index += 1) {
+    const col = index % columns;
+    const row = Math.floor(index / columns);
+    const inRow = Math.min(columns, count - row * columns);
+    const rowWidth = inRow * columnWidth;
+    const startX = margin + (contentWidth - rowWidth) / 2 + columnWidth / 2;
+    nodes.push({
+      x: startX + col * columnWidth,
+      y: startY + row * rowHeight,
+      r: nodeRadius,
+    });
+  }
+  const height = count === 0
+    ? 230
+    : startY + (rows - 1) * rowHeight + nodeRadius + 52;
+  return {
+    mode: 'tree',
+    width,
+    height: Math.max(250, Math.round(height)),
+    hub,
+    nodes,
+  };
+}
+
+function topologyRadialLayout(count, width) {
+  const hubRadius = width < 720 ? 38 : 44;
+  const nodeRadius = width < 720 ? 20 : 24;
+  let rings;
+  if (count <= 8) {
+    rings = [count];
+  } else if (count <= 18) {
+    const inner = Math.max(2, Math.ceil(count * 0.36));
+    rings = [inner, count - inner];
+  } else {
+    const inner = Math.max(3, Math.ceil(count * 0.2));
+    const middle = Math.max(4, Math.ceil(count * 0.33));
+    rings = [inner, middle, count - inner - middle];
+  }
+  rings = rings.filter((ring) => ring > 0);
+
+  let radii;
+  if (rings.length <= 1) {
+    const factor = count <= 3 ? 0.2 : count <= 6 ? 0.27 : 0.33;
+    radii = [Math.min(width * factor, 300)];
+  } else {
+    // At the widest supported size the extra ring spacing keeps labels clear
+    // of neighbouring nodes on dense maps.
+    const outer = Math.min(width * 0.41, 330);
+    radii = rings.length === 2
+      ? [outer * 0.6, outer]
+      : [outer * 0.48, outer * 0.74, outer];
+  }
+  const outer = radii[radii.length - 1] || 180;
+  const height = Math.max(260, Math.round(outer * 2 + nodeRadius * 2 + 80));
+  const hub = { x: width / 2, y: height / 2, r: hubRadius };
+  const nodes = [];
+  rings.forEach((ringCount, ringIndex) => {
+    const radius = radii[ringIndex];
+    const phase = -Math.PI / 2 + (ringIndex % 2 === 0 ? 0 : Math.PI / ringCount);
+    for (let index = 0; index < ringCount; index += 1) {
+      const angle = phase + (Math.PI * 2 * index) / ringCount;
+      nodes.push({
+        x: hub.x + Math.cos(angle) * radius,
+        y: hub.y + Math.sin(angle) * radius,
+        r: nodeRadius,
+      });
+    }
+  });
+  return {
+    mode: 'radial',
+    width,
+    height,
+    hub,
+    nodes,
+  };
+}
+
+function topologyLayout(count, width) {
+  const safeWidth = Math.max(280, Math.min(Number(width) || 720, 960));
+  const safeCount = Math.max(0, Math.floor(Number(count) || 0));
+  return safeWidth < 900
+    ? topologyTreeLayout(safeCount, safeWidth)
+    : topologyRadialLayout(safeCount, safeWidth);
+}
+
+function topologyLink(hub, node) {
+  const dx = node.x - hub.x;
+  const dy = node.y - hub.y;
+  const distance = Math.hypot(dx, dy) || 1;
+  const start = hub.r + 2;
+  const end = node.r + 2;
+  return {
+    x1: hub.x + (dx / distance) * start,
+    y1: hub.y + (dy / distance) * start,
+    x2: node.x - (dx / distance) * end,
+    y2: node.y - (dy / distance) * end,
+  };
+}
+
+function buildTopologyView({
+  devices = [],
+  network = null,
+  activeNetwork = null,
+  width = 720,
+} = {}) {
+  const safeWidth = Math.max(280, Math.min(Number(width) || 720, 960));
+  const list = (Array.isArray(devices) ? devices : []).filter((device) => device && device.ip);
+  const gateway = topologyGateway(list, network, activeNetwork);
+  const limit = topologyLimit(safeWidth);
+  const sorted = list.slice().sort((a, b) => (
+    ipNumber(a.ip) - ipNumber(b.ip) || String(a.ip).localeCompare(String(b.ip))
+  ));
+  const children = gateway
+    ? sorted.filter((device) => String(device.ip) !== gateway.ip)
+    : [];
+  const shown = children.slice(0, limit);
+  const layout = topologyLayout(gateway ? shown.length : 0, safeWidth);
+  const nameLimit = safeWidth < 560 ? 15 : safeWidth < 900 ? 18 : 20;
+  const networkLabel = String(
+    (activeNetwork && (activeNetwork.label || activeNetwork.title))
+    || (network && (network.label || network.title))
+    || '',
+  );
+  const networkCidr = String(
+    (network && network.cidr)
+    || (activeNetwork && activeNetwork.cidr)
+    || '',
+  );
+  const interfaceName = String((network && network.interface) || '');
+  const networkGatewayMac = String(
+    (network && network.gateway_mac)
+    || (activeNetwork && activeNetwork.gateway_mac)
+    || '',
+  );
+
+  const nodes = shown.map((device, index) => {
+    const position = layout.nodes[index] || { x: layout.hub.x, y: layout.hub.y, r: 18 };
+    const name = topologyName(device, device.ip);
+    const trust = topologyTrust(device);
+    const kind = device.kind || 'device';
+    return {
+      ip: String(device.ip),
+      name,
+      hostname: String(device.hostname || ''),
+      label: String(device.label || ''),
+      vendor: String(device.vendor || ''),
+      shortName: truncateTopologyText(name, nameLimit),
+      kind,
+      kindLabel: topologyKindLabel(kind),
+      online: !!device.online,
+      trust,
+      trustLabel: TRUST_LABELS[trust],
+      statusLabel: device.online ? 'Online' : 'Offline',
+      x: position.x,
+      y: position.y,
+      r: position.r,
+    };
+  });
+
+  const online = list.filter((device) => device.online).length;
+  let empty = null;
+  if (!list.length) {
+    empty = {
+      reason: 'no-devices',
+      title: 'No devices to map yet',
+      text: 'Run a scan to discover this network and identify its gateway.',
+    };
+  } else if (!gateway) {
+    empty = {
+      reason: 'no-gateway',
+      title: 'Gateway not identified',
+      text: 'Devices were found, but no gateway could be identified. Run another scan while connected to this network.',
+    };
+  }
+
+  const gatewayDevice = gateway && gateway.device ? gateway.device : null;
+  const gatewayTrust = gatewayDevice ? topologyTrust(gatewayDevice) : 'unknown';
+  const gatewayMac = networkGatewayMac || String((gatewayDevice && gatewayDevice.mac) || '');
+  const hub = gateway && list.length ? {
+    ip: gateway.ip,
+    name: gatewayDevice ? topologyName(gatewayDevice, gateway.ip) : 'Gateway',
+    hostname: String((gatewayDevice && gatewayDevice.hostname) || ''),
+    label: String((gatewayDevice && gatewayDevice.label) || ''),
+    vendor: String((gatewayDevice && gatewayDevice.vendor) || ''),
+    mac: gatewayMac,
+    kind: 'router',
+    kindLabel: 'Gateway',
+    missing: !!gateway.missing,
+    online: gatewayDevice ? !!gatewayDevice.online : null,
+    trust: gatewayTrust,
+    trustLabel: TRUST_LABELS[gatewayTrust],
+    statusLabel: gateway.missing ? 'Not in inventory' : gatewayDevice && gatewayDevice.online ? 'Online' : 'Offline',
+    networkLabel,
+    networkCidr,
+    interfaceName,
+    x: layout.hub.x,
+    y: layout.hub.y,
+    r: layout.hub.r,
+  } : null;
+
+  return {
+    width: layout.width,
+    height: layout.height,
+    mode: layout.mode,
+    hub,
+    nodes,
+    links: hub ? nodes.map((node) => ({
+      ...topologyLink(hub, node),
+      ip: node.ip,
+      offline: !node.online,
+    })) : [],
+    total: list.length,
+    childTotal: children.length,
+    shown: nodes.length,
+    hidden: Math.max(0, children.length - nodes.length),
+    online,
+    gatewayMissing: !!(gateway && gateway.missing),
+    empty,
+  };
+}
+
+function topologyIconBody(kind) {
+  const key = topologyLookup(ICON_ALIASES, kind) || kind;
+  return topologyLookup(ICONS, key) || ICONS.device;
+}
+
+function createTopologySvgElement(doc, tag, attributes = {}) {
+  const element = doc.createElementNS(TOPOLOGY_NS, tag);
+  Object.entries(attributes).forEach(([name, value]) => {
+    element.setAttribute(name, String(value));
+  });
+  return element;
+}
+
+function appendTopologyText(doc, parent, value, attributes = {}) {
+  const text = createTopologySvgElement(doc, 'text', attributes);
+  text.textContent = String(value);
+  parent.appendChild(text);
+  return text;
+}
+
+function appendTopologyTitle(doc, parent, value) {
+  const title = doc.createElementNS(TOPOLOGY_NS, 'title');
+  title.textContent = String(value);
+  parent.appendChild(title);
+  return title;
+}
+
+function createTopologyIcon(doc, kind, size) {
+  const iconElement = createTopologySvgElement(doc, 'svg', {
+    x: -size / 2,
+    y: -size / 2,
+    width: size,
+    height: size,
+    viewBox: '0 0 24 24',
+    class: 'topology-kind-icon',
+    'aria-hidden': 'true',
+    focusable: 'false',
+  });
+  // ICONS is fixed developer-authored markup selected through an allowlist.
+  // Device, host, and vendor data never enters this string.
+  iconElement.innerHTML = topologyIconBody(kind);
+  return iconElement;
+}
+
+function createTopologySvg(doc, view, options = {}) {
+  const hiddenNote = view.hidden ? ` ${view.hidden} more devices are not shown.` : '';
+  const gatewayNote = view.hub && view.hub.missing
+    ? ` Gateway ${view.hub.ip} is not in the inventory.`
+    : '';
+  const summary = view.hub
+    ? `Logical network topology. Gateway ${view.hub.ip} with ${view.shown} of ${view.childTotal} devices shown.${gatewayNote}${hiddenNote} Connections are logical, not confirmed physical links.`
+    : 'Logical network topology.';
+  const selected = options.selected || null;
+  const isSelected = (kind, ip) => !!(
+    selected
+    && selected.kind === kind
+    && String(selected.ip || '') === String(ip || '')
+  );
+  const svg = createTopologySvgElement(doc, 'svg', {
+    viewBox: `0 0 ${view.width} ${view.height}`,
+    class: `topology-svg topology-svg--${view.mode}`,
+    role: 'group',
+    'aria-label': summary,
+    preserveAspectRatio: 'xMidYMid meet',
+  });
+  appendTopologyTitle(doc, svg, 'Network topology');
+
+  const viewport = createTopologySvgElement(doc, 'g', {
+    class: 'topology-viewport',
+    transform: 'translate(0 0) scale(1)',
+  });
+  svg.appendChild(viewport);
+
+  const links = createTopologySvgElement(doc, 'g', {
+    class: 'topology-links',
+    'aria-hidden': 'true',
+  });
+  view.links.forEach((link) => {
+    links.appendChild(createTopologySvgElement(doc, 'line', {
+      class: `topology-link${link.offline ? ' is-offline' : ''}`,
+      x1: link.x1,
+      y1: link.y1,
+      x2: link.x2,
+      y2: link.y2,
+      'data-ip': link.ip || '',
+    }));
+  });
+  viewport.appendChild(links);
+
+  if (view.hub) {
+    const hub = view.hub;
+    const selectedHub = isSelected('gateway', hub.ip);
+    const hubClass = [
+      'topology-hub',
+      `trust-${hub.trust}`,
+      hub.missing ? 'is-missing' : '',
+      hub.online === false ? 'is-offline' : '',
+      hub.online === true ? 'is-online' : '',
+      selectedHub ? 'is-selected' : '',
+    ].filter(Boolean).join(' ');
+    const hubLabel = [
+      hub.name,
+      'Gateway',
+      `IP ${hub.ip}`,
+      hub.statusLabel,
+      `${hub.trustLabel} trust`,
+      hub.networkCidr ? `Network ${hub.networkCidr}` : '',
+      'Press Enter for gateway details',
+    ].filter(Boolean).join('. ');
+    const group = createTopologySvgElement(doc, 'g', {
+      class: hubClass,
+      transform: `translate(${hub.x} ${hub.y})`,
+      'data-ip': hub.ip,
+      'data-role': 'gateway',
+      role: 'button',
+      tabindex: '0',
+      'aria-label': hubLabel,
+    });
+    if (selectedHub) group.setAttribute('aria-current', 'true');
+    const status = hub.missing ? 'gateway not in inventory' : hub.online ? 'online' : 'offline';
+    appendTopologyTitle(doc, group, `Gateway ${hub.name}, ${hub.ip}, ${status}, ${hub.trustLabel}`);
+    group.appendChild(createTopologySvgElement(doc, 'circle', {
+      class: 'topology-hub-halo',
+      r: hub.r + 10,
+    }));
+    group.appendChild(createTopologySvgElement(doc, 'circle', {
+      class: 'topology-hub-ring',
+      r: hub.r,
+    }));
+    group.appendChild(createTopologySvgElement(doc, 'circle', {
+      class: 'topology-hub-surface',
+      r: hub.r - 6,
+    }));
+    group.appendChild(createTopologyIcon(doc, 'router', hub.r * 0.82));
+    group.appendChild(createTopologySvgElement(doc, 'circle', {
+      class: `topology-status-dot ${hub.missing ? 'missing' : hub.online ? 'online' : 'offline'}`,
+      cx: hub.r * 0.72,
+      cy: -hub.r * 0.72,
+      r: 5,
+    }));
+    appendTopologyText(doc, group, 'GATEWAY', {
+      class: 'topology-hub-kicker',
+      y: hub.r + 16,
+    });
+    if (hub.name && hub.name !== hub.ip && hub.name !== 'Gateway') {
+      appendTopologyText(doc, group, truncateTopologyText(hub.name, 18), {
+        class: 'topology-hub-name',
+        y: hub.r + 32,
+      });
+    }
+    appendTopologyText(doc, group, hub.ip, {
+      class: 'topology-hub-ip',
+      y: hub.r + (hub.name && hub.name !== hub.ip && hub.name !== 'Gateway' ? 46 : 32),
+    });
+    if (hub.missing) {
+      appendTopologyText(doc, group, 'not in inventory', {
+        class: 'topology-hub-missing',
+        y: hub.r + 60,
+      });
+    }
+    viewport.appendChild(group);
+  }
+
+  const nodes = createTopologySvgElement(doc, 'g', { class: 'topology-nodes' });
+  view.nodes.forEach((node) => {
+    const selectedNode = isSelected('device', node.ip);
+    const group = createTopologySvgElement(doc, 'g', {
+      class: `topology-node trust-${node.trust} ${node.online ? 'is-online' : 'is-offline'}${selectedNode ? ' is-selected' : ''}`,
+      transform: `translate(${node.x} ${node.y})`,
+      'data-ip': node.ip,
+      'data-role': 'device',
+      role: 'button',
+      tabindex: '0',
+      'aria-label': `${node.name}. ${node.kindLabel}. IP ${node.ip}. ${node.statusLabel}. ${node.trustLabel} trust. Press Enter for details.`,
+    });
+    if (selectedNode) group.setAttribute('aria-current', 'true');
+    appendTopologyTitle(
+      doc,
+      group,
+      `${node.name}, ${node.kindLabel}, ${node.ip}, ${node.online ? 'online' : 'offline'}, ${node.trustLabel}`,
+    );
+    group.appendChild(createTopologySvgElement(doc, 'circle', {
+      class: 'topology-node-halo',
+      r: node.r + 4,
+    }));
+    group.appendChild(createTopologySvgElement(doc, 'circle', {
+      class: 'topology-node-surface',
+      r: node.r,
+    }));
+    group.appendChild(createTopologyIcon(doc, node.kind, node.r * 1.05));
+    group.appendChild(createTopologySvgElement(doc, 'circle', {
+      class: `topology-status-dot ${node.online ? 'online' : 'offline'}`,
+      cx: node.r * 0.68,
+      cy: -node.r * 0.68,
+      r: 4,
+    }));
+    appendTopologyText(doc, group, node.shortName, {
+      class: 'topology-node-name',
+      y: node.r + 14,
+    });
+    appendTopologyText(doc, group, node.ip, {
+      class: 'topology-node-ip',
+      y: node.r + 26,
+    });
+    if (!node.online) {
+      appendTopologyText(doc, group, 'offline', {
+        class: 'topology-node-offline',
+        y: node.r + 37,
+      });
+    }
+    nodes.appendChild(group);
+  });
+  viewport.appendChild(nodes);
+  return svg;
+}
+
+function topologyModelNode(model, ip) {
+  if (!model || !Array.isArray(model.nodes)) return null;
+  return model.nodes.find((node) => String(node.ip) === String(ip)) || null;
+}
+
+function topologyNodeFromTarget(target) {
+  if (!target || typeof target.closest !== 'function') return null;
+  return target.closest('.topology-node[data-ip], .topology-hub[data-role="gateway"]');
+}
+
+function syncTopologySelection() {
+  const host = $('#topology-svg-host');
+  if (!host) return;
+  const selected = state.topology.selected;
+  $$('.topology-node[data-ip], .topology-hub[data-role="gateway"]', host).forEach((element) => {
+    const isGateway = element.classList.contains('topology-hub');
+    const ip = element.getAttribute('data-ip');
+    const active = !!(
+      selected
+      && selected.kind === (isGateway ? 'gateway' : 'device')
+      && String(selected.ip || '') === String(ip || '')
+    );
+    element.classList.toggle('is-selected', active);
+    if (active) element.setAttribute('aria-current', 'true');
+    else element.removeAttribute('aria-current');
+  });
+}
+
+function hideTopologySelection() {
+  const panel = $('#topology-selection');
+  if (!panel) return;
+  panel.hidden = true;
+}
+
+function clearTopologySelection() {
+  state.topology.selected = null;
+  syncTopologySelection();
+  hideTopologySelection();
+}
+
+function renderTopologySelection(hub) {
+  const panel = $('#topology-selection');
+  const title = $('#topology-selection-title');
+  const body = $('#topology-selection-body');
+  if (!panel || !title || !body) return;
+  if (!hub) {
+    panel.hidden = true;
+    return;
+  }
+  const parts = [
+    hub.ip,
+    hub.statusLabel,
+    `${hub.trustLabel} trust`,
+  ];
+  if (hub.networkLabel && hub.networkLabel !== hub.networkCidr) parts.push(hub.networkLabel);
+  if (hub.networkCidr) parts.push(`Network ${hub.networkCidr}`);
+  if (hub.interfaceName) parts.push(`Interface ${hub.interfaceName}`);
+  if (hub.mac) parts.push(`MAC ${hub.mac}`);
+  if (hub.vendor) parts.push(`Vendor ${hub.vendor}`);
+  if (hub.missing) {
+    parts.push('Not in the device inventory. Run another scan while connected to this network.');
+  }
+  title.textContent = `Gateway${hub.name && hub.name !== 'Gateway' ? ` · ${hub.name}` : ''}`;
+  body.textContent = parts.filter(Boolean).join(' · ');
+  panel.hidden = false;
+}
+
+function selectTopologyGateway() {
+  const model = state.topology.model;
+  const hub = model && model.hub;
+  if (!hub) return false;
+  state.topology.selected = { kind: 'gateway', ip: String(hub.ip || '') };
+  if (state.drawerIp) closeDrawer();
+  hideTopologyTooltip();
+  syncTopologySelection();
+  renderTopologySelection(hub);
+  return true;
+}
+
+function selectTopologyDevice(ip) {
+  const key = String(ip || '');
+  if (!key || !state.devices.has(key)) return false;
+  state.topology.selected = { kind: 'device', ip: key };
+  hideTopologySelection();
+  hideTopologyTooltip();
+  syncTopologySelection();
+  openDrawer(key);
+  return true;
+}
+
+function activateTopologyNode(element) {
+  if (!element) return null;
+  const role = element.getAttribute ? element.getAttribute('data-role') : '';
+  if (role === 'gateway' || (element.classList && element.classList.contains('topology-hub'))) {
+    return selectTopologyGateway() ? 'gateway' : null;
+  }
+  const ip = element.getAttribute ? element.getAttribute('data-ip') : '';
+  if (!ip || !state.devices.has(ip)) return null;
+  return selectTopologyDevice(ip) ? 'device' : null;
+}
+
+function updateTopologyViewStatus(model, visible, matches) {
+  const status = $('#topology-view-status');
+  if (!status) return;
+  const query = String(state.topology.search || '').trim();
+  const filter = state.topology.filter || 'all';
+  if (!model || (!query && filter === 'all')) {
+    status.hidden = true;
+    status.textContent = '';
+    return;
+  }
+  const nodeCount = Array.isArray(model.nodes) ? model.nodes.length : 0;
+  const bits = [
+    visible
+      ? `Showing ${visible} of ${nodeCount} device node${nodeCount === 1 ? '' : 's'}`
+      : 'No device nodes match this view; the gateway stays visible',
+  ];
+  if (query) {
+    bits.push(`${matches} match${matches === 1 ? '' : 'es'} for “${truncateTopologyText(query, 36)}”`);
+  }
+  status.textContent = bits.join(' · ');
+  status.hidden = false;
+}
+
+function applyTopologyVisibility() {
+  const host = $('#topology-svg-host');
+  const model = state.topology.model;
+  if (!host || !model || host.hidden) {
+    updateTopologyViewStatus(null, 0, 0);
+    return;
+  }
+  const query = String(state.topology.search || '').trim();
+  const filter = state.topology.filter || 'all';
+  let visible = 0;
+  let matches = 0;
+
+  $$('.topology-node[data-ip]', host).forEach((element) => {
+    const node = topologyModelNode(model, element.getAttribute('data-ip'));
+    if (!node) return;
+    const stateForNode = topologyNodeDisplayState(node, filter, query);
+    element.classList.toggle('is-filtered', stateForNode.filtered);
+    element.classList.toggle('is-dimmed', stateForNode.dimmed);
+    element.classList.toggle('is-search-match', stateForNode.matched);
+    if (stateForNode.filterMatch) visible += 1;
+    if (stateForNode.searchMatch) matches += 1;
+  });
+
+  $$('.topology-link[data-ip]', host).forEach((element) => {
+    const node = topologyModelNode(model, element.getAttribute('data-ip'));
+    if (!node) return;
+    const stateForNode = topologyNodeDisplayState(node, filter, query);
+    element.classList.toggle('is-filtered', stateForNode.filtered);
+    element.classList.toggle('is-dimmed', stateForNode.dimmed);
+  });
+
+  const hubElement = $('.topology-hub[data-role="gateway"]', host);
+  if (hubElement && model.hub) {
+    const stateForHub = topologyNodeDisplayState(model.hub, 'all', query);
+    hubElement.classList.toggle('is-dimmed', stateForHub.dimmed);
+    hubElement.classList.toggle('is-search-match', stateForHub.matched);
+  }
+
+  updateTopologyViewStatus(model, visible, matches);
+}
+
+function applyTopologyTransform() {
+  const host = $('#topology-svg-host');
+  const model = state.topology.model;
+  if (!host || !model) return;
+  const viewport = $('.topology-viewport', host);
+  if (viewport) viewport.setAttribute('transform', topologyTransform(state.topology.view, model));
+  const scale = topologyClampScale(state.topology.view.scale);
+  const label = $('#topology-zoom-label');
+  if (label) label.textContent = `${Math.round(scale * 100)}%`;
+  const zoomIn = $('#topology-zoom-in');
+  const zoomOut = $('#topology-zoom-out');
+  if (zoomIn) zoomIn.disabled = scale >= TOPOLOGY_ZOOM_MAX - 0.001;
+  if (zoomOut) zoomOut.disabled = scale <= TOPOLOGY_ZOOM_MIN + 0.001;
+}
+
+function topologySetScale(nextScale) {
+  const model = state.topology.model;
+  if (!model) return;
+  const current = state.topology.view;
+  const scale = topologyClampScale(nextScale);
+  state.topology.view = topologyPanView(
+    { scale },
+    current.x,
+    current.y,
+    model.width,
+    model.height,
+  );
+  applyTopologyTransform();
+}
+
+function zoomTopology(direction) {
+  topologySetScale(topologyZoomScale(state.topology.view.scale, direction));
+}
+
+function fitTopologyViewport() {
+  if (!state.topology.model) return;
+  state.topology.view = topologyFitView();
+  applyTopologyTransform();
+}
+
+function setTopologyFilter(filter) {
+  const next = String(filter || 'all');
+  if (!TOPOLOGY_FILTERS.includes(next)) return;
+  state.topology.filter = next;
+  const filters = $('#topology-filters');
+  if (filters) {
+    $$('[data-topology-filter]', filters).forEach((button) => {
+      const active = button.getAttribute('data-topology-filter') === next;
+      button.classList.toggle('active', active);
+      button.setAttribute('aria-pressed', String(active));
+    });
+  }
+  applyTopologyVisibility();
+}
+
+function syncTopologyFilterButtons() {
+  const filters = $('#topology-filters');
+  if (!filters) return;
+  const filter = state.topology.filter || 'all';
+  $$('[data-topology-filter]', filters).forEach((button) => {
+    const active = button.getAttribute('data-topology-filter') === filter;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-pressed', String(active));
+  });
+}
+
+function topologyTooltipData(element) {
+  const model = state.topology.model;
+  if (!element || !model) return null;
+  const isGateway = element.getAttribute('data-role') === 'gateway'
+    || (element.classList && element.classList.contains('topology-hub'));
+  const node = isGateway
+    ? model.hub
+    : topologyModelNode(model, element.getAttribute('data-ip'));
+  if (!node) return null;
+  return { node, isGateway: !!isGateway };
+}
+
+function topologyTooltipFields(node, isGateway) {
+  if (!node) return [];
+  const fields = [];
+  if (node.kindLabel) fields.push(['Type', node.kindLabel]);
+  if (node.ip) fields.push(['IP', node.ip]);
+  if (node.statusLabel) fields.push(['Status', node.statusLabel]);
+  if (node.trustLabel) fields.push(['Trust', node.trustLabel]);
+  if (isGateway) {
+    if (node.networkCidr) fields.push(['Network', node.networkCidr]);
+    if (node.interfaceName) fields.push(['Interface', node.interfaceName]);
+    if (node.mac) fields.push(['Gateway MAC', node.mac]);
+  } else {
+    if (node.hostname && node.hostname !== node.name) fields.push(['Hostname', node.hostname]);
+    if (node.vendor) fields.push(['Vendor', node.vendor]);
+  }
+  return fields;
+}
+
+function hideTopologyTooltip() {
+  const tooltip = $('#topology-tooltip');
+  if (tooltip) tooltip.hidden = true;
+}
+
+function showTopologyTooltip(element) {
+  const tooltip = $('#topology-tooltip');
+  const map = $('#topology-map');
+  const data = topologyTooltipData(element);
+  if (!tooltip || !map || !data) return;
+  tooltip.replaceChildren();
+  const title = document.createElement('strong');
+  title.className = 'topology-tip-title';
+  title.textContent = data.node.name || data.node.ip || 'Device';
+  tooltip.appendChild(title);
+  topologyTooltipFields(data.node, data.isGateway).forEach(([label, value]) => {
+    const row = document.createElement('span');
+    row.className = 'topology-tip-row';
+    const labelElement = document.createElement('span');
+    labelElement.className = 'topology-tip-label';
+    labelElement.textContent = label;
+    const valueElement = document.createElement('span');
+    valueElement.className = 'topology-tip-value';
+    valueElement.textContent = String(value);
+    row.appendChild(labelElement);
+    row.appendChild(valueElement);
+    tooltip.appendChild(row);
+  });
+  tooltip.hidden = false;
+
+  if (typeof element.getBoundingClientRect !== 'function') return;
+  if (typeof map.getBoundingClientRect !== 'function') return;
+  const nodeRect = element.getBoundingClientRect();
+  const mapRect = map.getBoundingClientRect();
+  const tipRect = typeof tooltip.getBoundingClientRect === 'function'
+    ? tooltip.getBoundingClientRect()
+    : { width: 0, height: 0 };
+  let left = nodeRect.left - mapRect.left + nodeRect.width / 2 - tipRect.width / 2;
+  let top = nodeRect.top - mapRect.top - tipRect.height - 8;
+  if (top < 4) top = nodeRect.bottom - mapRect.top + 8;
+  const maxLeft = Math.max(4, mapRect.width - tipRect.width - 4);
+  left = Math.max(4, Math.min(maxLeft, left));
+  if (mapRect.height - top < tipRect.height + 4) top = Math.max(4, mapRect.height - tipRect.height - 4);
+  tooltip.style.left = `${Math.round(left)}px`;
+  tooltip.style.top = `${Math.round(top)}px`;
+}
+
+function onTopologySearchInput(event) {
+  state.topology.search = String((event.target && event.target.value) || '');
+  applyTopologyVisibility();
+}
+
+function onTopologyFilterClick(event) {
+  const button = event.target && typeof event.target.closest === 'function'
+    ? event.target.closest('[data-topology-filter]')
+    : null;
+  if (!button) return;
+  setTopologyFilter(button.getAttribute('data-topology-filter'));
+}
+
+function onTopologyMapClick(event) {
+  const node = topologyNodeFromTarget(event.target);
+  if (node) {
+    if (event.preventDefault) event.preventDefault();
+    activateTopologyNode(node);
+    return;
+  }
+  const target = event.target;
+  if (target && typeof target.closest === 'function'
+    && target.closest('.topology-controls, .topology-zoom, .topology-tooltip, .topology-empty, button, input, select, a')) {
+    return;
+  }
+  if (state.topology.selected) clearTopologySelection();
+}
+
+function onTopologyMapKeydown(event) {
+  const node = topologyNodeFromTarget(event.target);
+  if (!node) return;
+  if (event.key !== 'Enter' && event.key !== ' ') return;
+  if (event.preventDefault) event.preventDefault();
+  activateTopologyNode(node);
+}
+
+function onTopologyMapPointerOver(event) {
+  const node = topologyNodeFromTarget(event.target);
+  if (!node) return;
+  const related = event.relatedTarget;
+  if (related && typeof node.contains === 'function' && node.contains(related)) return;
+  showTopologyTooltip(node);
+}
+
+function onTopologyMapPointerOut(event) {
+  const node = topologyNodeFromTarget(event.target);
+  if (!node) return;
+  const related = event.relatedTarget;
+  if (related && typeof node.contains === 'function' && node.contains(related)) return;
+  if (document.activeElement === node) return;
+  hideTopologyTooltip();
+}
+
+function onTopologyMapFocusIn(event) {
+  const node = topologyNodeFromTarget(event.target);
+  if (node) showTopologyTooltip(node);
+}
+
+function onTopologyMapFocusOut(event) {
+  const node = topologyNodeFromTarget(event.target);
+  if (!node) return;
+  const related = event.relatedTarget;
+  if (related && typeof node.contains === 'function' && node.contains(related)) return;
+  hideTopologyTooltip();
+}
+
+function onTopologyPanStart(event) {
+  if (!state.topology.model || state.topology.pan) return;
+  const target = event.target;
+  if (target && typeof target.closest === 'function'
+    && target.closest('.topology-node, .topology-hub, .topology-controls, .topology-zoom, .topology-tooltip, .topology-empty, button, input, select, a')) {
+    return;
+  }
+  if (event.pointerType === 'mouse' && event.button !== 0) return;
+  const map = $('#topology-map');
+  const current = state.topology.view;
+  state.topology.pan = {
+    id: event.pointerId,
+    startX: event.clientX,
+    startY: event.clientY,
+    originX: current.x,
+    originY: current.y,
+    moved: false,
+  };
+  if (map) {
+    map.classList.add('is-panning');
+    if (typeof map.setPointerCapture === 'function') {
+      try {
+        map.setPointerCapture(event.pointerId);
+      } catch (error) {
+        state.topology.pan = null;
+        map.classList.remove('is-panning');
+      }
+    }
+  }
+  hideTopologyTooltip();
+  if (event.preventDefault) event.preventDefault();
+}
+
+function onTopologyPanMove(event) {
+  const pan = state.topology.pan;
+  if (!pan || event.pointerId !== pan.id) return;
+  const dx = event.clientX - pan.startX;
+  const dy = event.clientY - pan.startY;
+  if (!pan.moved && Math.hypot(dx, dy) < 3) return;
+  pan.moved = true;
+  const model = state.topology.model;
+  if (!model) return;
+  state.topology.view = topologyPanView(
+    { scale: state.topology.view.scale },
+    pan.originX + dx,
+    pan.originY + dy,
+    model.width,
+    model.height,
+  );
+  applyTopologyTransform();
+  if (event.preventDefault) event.preventDefault();
+}
+
+function onTopologyPanEnd(event) {
+  const pan = state.topology.pan;
+  if (!pan || event.pointerId !== pan.id) return;
+  state.topology.pan = null;
+  const map = $('#topology-map');
+  if (!map) return;
+  map.classList.remove('is-panning');
+  if (typeof map.hasPointerCapture === 'function' && map.hasPointerCapture(event.pointerId)) {
+    try {
+      map.releasePointerCapture(event.pointerId);
+    } catch (error) {
+      // The pointer may already have been released by the browser.
+    }
+  }
+}
+
+function bindTopologyEvents() {
+  if (state.topology.bound) return;
+  const map = $('#topology-map');
+  if (!map) return;
+  state.topology.bound = true;
+  map.addEventListener('click', onTopologyMapClick);
+  map.addEventListener('keydown', onTopologyMapKeydown);
+  map.addEventListener('pointerover', onTopologyMapPointerOver);
+  map.addEventListener('pointerout', onTopologyMapPointerOut);
+  map.addEventListener('focusin', onTopologyMapFocusIn);
+  map.addEventListener('focusout', onTopologyMapFocusOut);
+  map.addEventListener('pointerdown', onTopologyPanStart);
+  map.addEventListener('pointermove', onTopologyPanMove);
+  map.addEventListener('pointerup', onTopologyPanEnd);
+  map.addEventListener('pointercancel', onTopologyPanEnd);
+  map.addEventListener('lostpointercapture', onTopologyPanEnd);
+
+  const search = $('#topology-search');
+  if (search) search.addEventListener('input', onTopologySearchInput);
+  const filters = $('#topology-filters');
+  if (filters) filters.addEventListener('click', onTopologyFilterClick);
+  const zoomIn = $('#topology-zoom-in');
+  if (zoomIn) zoomIn.addEventListener('click', () => zoomTopology(1));
+  const zoomOut = $('#topology-zoom-out');
+  if (zoomOut) zoomOut.addEventListener('click', () => zoomTopology(-1));
+  const fit = $('#topology-fit');
+  if (fit) fit.addEventListener('click', fitTopologyViewport);
+  const close = $('#topology-selection-close');
+  if (close) close.addEventListener('click', clearTopologySelection);
 }
 
 function trustBadge(trust) {
@@ -411,10 +1506,12 @@ function handleEvent(event) {
       const previousActive = state.activeNetwork ? state.activeNetwork.id : null;
       state.networks = event.networks || state.networks;
       const nextActive = event.active || null;
+      // Keep the active summary current for switches and metadata-only changes
+      // such as renaming the active network.
+      state.activeNetwork = state.networks.find((network) => network.id === nextActive) || null;
       if (previousActive !== nextActive) {
         // Update the active id before reloading so event and diff responses are
         // filtered against the network that is actually active now.
-        state.activeNetwork = state.networks.find((network) => network.id === nextActive) || null;
         if (state.network && state.network.network_id !== nextActive) state.network = null;
         if (state.drawerIp) closeDrawer();
         state.devices = new Map();
@@ -499,6 +1596,7 @@ function renderAll() {
   renderNetwork();
   if ($('#networks') && $('#networks').open) renderNetworks();
   renderStats();
+  renderTopology();
   renderScan();
   renderDiff();
   renderCollectors();
@@ -551,6 +1649,244 @@ function renderNetwork() {
   if (state.scan.running) dot.classList.add('scanning');
   else if (state.scan.phase === 'error') dot.classList.add('error');
   else if (state.scan.phase === 'done') dot.classList.add('live');
+}
+
+function topologySignatureValue(value) {
+  return value == null ? '' : String(value);
+}
+
+function topologyDeviceSignature(device) {
+  return [
+    device.ip,
+    device.name,
+    device.hostname,
+    device.label,
+    device.vendor,
+    device.kind,
+    device.online ? 'online' : 'offline',
+    device.trust,
+    device.is_gateway ? 'gateway' : '',
+    device.mac,
+  ].map(topologySignatureValue);
+}
+
+function topologyRenderSignature(width) {
+  const network = state.network;
+  const active = state.activeNetwork;
+  const devices = deviceList()
+    .slice()
+    .sort((left, right) => String(left.ip || '').localeCompare(String(right.ip || '')));
+  return JSON.stringify({
+    width: Math.round(Number(width) || 0),
+    networkId: activeNetworkId(),
+    network: network
+      ? [
+        network.id,
+        network.network_id,
+        network.cidr,
+        network.gateway,
+        network.label,
+        network.title,
+        network.interface,
+        network.gateway_mac,
+      ]
+      : null,
+    active: active
+      ? [
+        active.id,
+        active.cidr,
+        active.gateway,
+        active.label,
+        active.title,
+        active.interface,
+        active.gateway_mac,
+      ]
+      : null,
+    devices: devices.map(topologyDeviceSignature),
+  });
+}
+
+function topologyFocusedNode(host) {
+  const active = document.activeElement;
+  if (!active || active === document.body || typeof active.closest !== 'function') return null;
+  if (!host.contains(active)) return null;
+  const node = active.closest('.topology-node[data-ip], .topology-hub[data-role="gateway"]');
+  if (!node) return null;
+  return {
+    role: node.getAttribute('data-role') || '',
+    ip: node.getAttribute('data-ip') || '',
+  };
+}
+
+function restoreTopologyFocus(host, focus) {
+  if (!focus) return;
+  const selector = focus.role === 'gateway'
+    ? '.topology-hub[data-role="gateway"]'
+    : '.topology-node[data-ip]';
+  const target = $$(selector, host).find(
+    (element) => String(element.getAttribute('data-ip') || '') === focus.ip,
+  );
+  if (!target || target.classList.contains('is-filtered')) return;
+  if (typeof target.focus === 'function') target.focus({ preventScroll: true });
+}
+
+function topologyContextText() {
+  const active = state.activeNetwork;
+  const network = state.network;
+  const bits = [];
+  if (active) {
+    const label = active.label || active.title;
+    if (label) bits.push(String(label));
+  }
+  const cidr = (network && network.cidr) || (active && active.cidr);
+  if (cidr && !bits.includes(String(cidr))) bits.push(String(cidr));
+  return bits.join(' · ') || 'No active network yet';
+}
+
+function renderTopologyAccessibleList(view) {
+  const list = $('#topology-accessible-list');
+  if (!list) return;
+  const items = [];
+  if (view.hub) {
+    const status = view.hub.missing
+      ? 'not in inventory'
+      : view.hub.online ? 'online' : 'offline';
+    const name = view.hub.missing || view.hub.name === 'Gateway'
+      ? 'Gateway'
+      : `Gateway ${view.hub.name}`;
+    items.push(`${name}, ${view.hub.ip}, ${status}, ${view.hub.trustLabel}`);
+  }
+  view.nodes.forEach((node) => {
+    items.push(`${node.name}, ${node.ip}, ${node.online ? 'online' : 'offline'}, ${node.trustLabel}`);
+  });
+  if (view.hidden) {
+    items.push(`${view.hidden} more devices are not shown in the map.`);
+  }
+  list.replaceChildren(...items.map((text) => {
+    const item = document.createElement('li');
+    item.textContent = text;
+    return item;
+  }));
+}
+
+function renderTopology() {
+  const map = $('#topology-map');
+  const svgHost = $('#topology-svg-host');
+  const empty = $('#topology-empty');
+  if (!map || !svgHost || !empty) return;
+
+  const networkId = activeNetworkId();
+  const networkChanged = state.topology.networkId !== networkId;
+  if (networkChanged) {
+    state.topology.networkId = networkId;
+    state.topology.selected = null;
+    state.topology.view = topologyFitView();
+    state.topology.pan = null;
+    state.topology.signature = null;
+  }
+
+  const measured = Math.round(svgHost.clientWidth || map.clientWidth || 720);
+  const width = Math.max(280, Math.min(measured, 960));
+  const signature = topologyRenderSignature(width);
+  if (signature === state.topology.signature) return;
+  const focusedNode = networkChanged ? null : topologyFocusedNode(svgHost);
+  state.topology.signature = signature;
+  state.topology.pan = null;
+  map.classList.remove('is-panning');
+
+  const view = buildTopologyView({
+    devices: deviceList(),
+    network: state.network,
+    activeNetwork: state.activeNetwork,
+    width,
+  });
+  state.topology.width = width;
+  state.topology.model = view;
+
+  $('#topology-context').textContent = topologyContextText();
+  let countText = `${plural(view.total, 'device')} · ${view.online} online`;
+  if (view.gatewayMissing) countText += ' · gateway not in inventory';
+  $('#topology-count').textContent = countText;
+
+  const controls = $('#topology-controls');
+  const zoom = $('#topology-zoom');
+  const viewStatus = $('#topology-view-status');
+
+  if (view.empty) {
+    state.topology.selected = null;
+    svgHost.hidden = true;
+    empty.hidden = false;
+    if (controls) controls.hidden = true;
+    if (zoom) zoom.hidden = true;
+    if (viewStatus) {
+      viewStatus.hidden = true;
+      viewStatus.textContent = '';
+    }
+    hideTopologyTooltip();
+    hideTopologySelection();
+    $('#topology-empty-title').textContent = view.empty.title;
+    $('#topology-empty-text').textContent = view.empty.text;
+    $('#topology-more').hidden = true;
+    renderTopologyAccessibleList(view);
+    return;
+  }
+
+  if (controls) controls.hidden = false;
+  if (zoom) zoom.hidden = false;
+  empty.hidden = true;
+  svgHost.hidden = false;
+  hideTopologyTooltip();
+
+  const selected = state.topology.selected;
+  if (selected) {
+    const exists = selected.kind === 'gateway'
+      ? !!(view.hub && String(view.hub.ip || '') === String(selected.ip || ''))
+      : view.nodes.some((node) => String(node.ip) === String(selected.ip || ''));
+    if (!exists) state.topology.selected = null;
+  }
+
+  svgHost.replaceChildren(createTopologySvg(document, view, {
+    selected: state.topology.selected,
+  }));
+  syncTopologyFilterButtons();
+  applyTopologyTransform();
+  applyTopologyVisibility();
+  syncTopologySelection();
+  if (state.topology.selected && state.topology.selected.kind === 'gateway') {
+    renderTopologySelection(view.hub);
+  } else {
+    hideTopologySelection();
+  }
+  restoreTopologyFocus(svgHost, focusedNode);
+
+  const more = $('#topology-more');
+  if (view.hidden) {
+    more.hidden = false;
+    more.textContent = `Showing ${view.shown} of ${view.childTotal} devices around the gateway. Use the device list below for the rest.`;
+  } else {
+    more.hidden = true;
+    more.textContent = '';
+  }
+  renderTopologyAccessibleList(view);
+}
+
+function setupTopologyResize() {
+  const map = $('#topology-map');
+  if (!map) return;
+  const schedule = () => {
+    if (state.topology.frame) return;
+    state.topology.frame = requestAnimationFrame(() => {
+      state.topology.frame = 0;
+      const svgHost = $('#topology-svg-host');
+      const width = Math.round((svgHost && svgHost.clientWidth) || map.clientWidth || 0);
+      if (width && Math.abs(width - state.topology.width) >= 12) renderTopology();
+    });
+  };
+  if (typeof ResizeObserver === 'function') {
+    new ResizeObserver(schedule).observe(map);
+  } else {
+    window.addEventListener('resize', schedule);
+  }
 }
 
 function renderStats() {
@@ -1878,6 +3214,8 @@ function bindEvents() {
   $('#scan-btn').addEventListener('click', () => startScan({}));
   $('#stop-btn').addEventListener('click', stopScan);
   $('#scan-retry').addEventListener('click', () => startScan({}));
+  $('#topology-scan').addEventListener('click', () => startScan({}));
+  bindTopologyEvents();
   $('#trust-help').addEventListener('click', () => setTrustGuideVisible(true, true));
   $('#trust-guide-close').addEventListener('click', dismissTrustGuide);
   $('#trust-guide-done').addEventListener('click', dismissTrustGuide);
@@ -2120,6 +3458,7 @@ async function init() {
   loadPrefs();
   applyPrefs();
   bindEvents();
+  setupTopologyResize();
   setTrustGuideVisible(!readTrustGuideDismissed());
   setupAutoScan();
   await Promise.all([loadState(), loadHistory()]);

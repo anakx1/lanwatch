@@ -151,6 +151,65 @@
         </div>
       </section>
 
+      <section class="topology" id="topology" aria-labelledby="topology-title" aria-describedby="topology-note">
+        <div class="topology-head">
+          <div class="topology-heading">
+            <h2 id="topology-title">Network topology</h2>
+            <p class="topology-context" id="topology-context">No active network yet</p>
+          </div>
+          <span class="topology-count" id="topology-count">0 devices</span>
+        </div>
+        <div class="topology-legend" aria-label="Topology legend">
+          <span class="topology-legend-item"><i class="topology-swatch online" aria-hidden="true"></i>Online</span>
+          <span class="topology-legend-item"><i class="topology-swatch offline" aria-hidden="true"></i>Offline</span>
+          <span class="topology-legend-item"><i class="topology-swatch trust-trusted" aria-hidden="true"></i>Trusted</span>
+          <span class="topology-legend-item"><i class="topology-swatch trust-unknown" aria-hidden="true"></i>Unknown</span>
+          <span class="topology-legend-item"><i class="topology-swatch trust-ignored" aria-hidden="true"></i>Ignored</span>
+        </div>
+        <div class="topology-toolbar" id="topology-controls">
+          <label class="topology-search" for="topology-search">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
+              <circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/>
+            </svg>
+            <input id="topology-search" type="search" placeholder="Find IP, name, vendor…" autocomplete="off" spellcheck="false" aria-label="Search topology devices" aria-controls="topology-svg-host">
+          </label>
+          <div class="topology-filters" id="topology-filters" role="group" aria-label="Filter topology devices">
+            <button type="button" class="filter-chip active" data-topology-filter="all" aria-pressed="true" aria-label="All devices">All</button>
+            <button type="button" class="filter-chip" data-topology-filter="online" aria-pressed="false">Online</button>
+            <button type="button" class="filter-chip" data-topology-filter="offline" aria-pressed="false">Offline</button>
+            <button type="button" class="filter-chip" data-topology-filter="trusted" aria-pressed="false">Trusted</button>
+            <button type="button" class="filter-chip" data-topology-filter="unknown" aria-pressed="false">Unknown</button>
+            <button type="button" class="filter-chip" data-topology-filter="ignored" aria-pressed="false">Ignored</button>
+          </div>
+        </div>
+        <p class="topology-view-status" id="topology-view-status" role="status" aria-live="polite" hidden></p>
+        <div class="topology-map" id="topology-map">
+          <div class="topology-zoom" id="topology-zoom" role="group" aria-label="Map zoom controls" hidden>
+            <button class="topology-control" id="topology-zoom-out" type="button" aria-label="Zoom out" title="Zoom out">−</button>
+            <span class="topology-zoom-value" id="topology-zoom-label" aria-live="polite">100%</span>
+            <button class="topology-control" id="topology-zoom-in" type="button" aria-label="Zoom in" title="Zoom in">+</button>
+            <button class="topology-control topology-fit" id="topology-fit" type="button" aria-label="Fit topology to panel" title="Fit / reset view">Fit</button>
+          </div>
+          <div class="topology-svg-host" id="topology-svg-host"></div>
+          <div class="topology-empty" id="topology-empty" hidden>
+            <h3 id="topology-empty-title">No devices to map yet</h3>
+            <p id="topology-empty-text">Run a scan to discover this network and identify its gateway.</p>
+            <button class="btn primary small" id="topology-scan" type="button">Scan now</button>
+          </div>
+          <div class="topology-tooltip" id="topology-tooltip" role="tooltip" hidden></div>
+          <p class="topology-more" id="topology-more" hidden></p>
+        </div>
+        <div class="topology-selection" id="topology-selection" role="status" aria-live="polite" hidden>
+          <div class="topology-selection-head">
+            <strong id="topology-selection-title">Gateway</strong>
+            <button class="icon-btn" id="topology-selection-close" type="button" aria-label="Clear topology selection" title="Clear selection">×</button>
+          </div>
+          <p id="topology-selection-body"></p>
+        </div>
+        <p class="topology-note" id="topology-note">Connections are logical: they show which devices share this gateway, not confirmed switches, Wi-Fi access points, or cabling. Use the device list below for full details and a keyboard-friendly alternative.</p>
+        <ul class="visually-hidden" id="topology-accessible-list" aria-label="Topology devices"></ul>
+      </section>
+
       <section class="events-panel" id="events-panel" aria-labelledby="events-panel-title">
         <div class="events-panel-head">
           <div>

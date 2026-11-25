@@ -338,6 +338,155 @@ class WebTests(unittest.TestCase):
         self.assertIn('id="drawer-trust"', text)
         self.assertIn('id="trust-filter"', text)
 
+    def test_dashboard_topology_panel(self) -> None:
+        status, _, body = self.request("/")
+        self.assertEqual(status, 200)
+        text = body.decode()
+        for element in (
+            'id="topology"',
+            'id="topology-title"',
+            'id="topology-context"',
+            'id="topology-count"',
+            'id="topology-map"',
+            'id="topology-svg-host"',
+            'id="topology-empty"',
+            'id="topology-empty-title"',
+            'id="topology-empty-text"',
+            'id="topology-scan"',
+            'id="topology-more"',
+            'id="topology-note"',
+            'id="topology-accessible-list"',
+            'id="topology-controls"',
+            'id="topology-search"',
+            'id="topology-filters"',
+            'id="topology-view-status"',
+            'id="topology-zoom"',
+            'id="topology-zoom-out"',
+            'id="topology-zoom-in"',
+            'id="topology-zoom-label"',
+            'id="topology-fit"',
+            'id="topology-tooltip"',
+            'id="topology-selection"',
+            'id="topology-selection-close"',
+        ):
+            self.assertIn(element, text)
+        self.assertIn("Network topology", text)
+        self.assertIn("Connections are logical", text)
+        self.assertIn("topology-swatch online", text)
+        self.assertIn("topology-swatch trust-trusted", text)
+        self.assertIn('data-topology-filter="online"', text)
+        self.assertIn('data-topology-filter="trusted"', text)
+        self.assertIn('aria-label="Search topology devices"', text)
+        self.assertNotIn("<canvas", text)
+
+        status, _, body = self.request("/static/app.js")
+        self.assertEqual(status, 200)
+        script = body.decode()
+        for symbol in (
+            "function topologyLimit",
+            "function topologyGateway",
+            "function buildTopologyView",
+            "function createTopologySvg",
+            "function renderTopology",
+            "function setupTopologyResize",
+            "function bindTopologyEvents",
+            "function activateTopologyNode",
+            "function topologyMatchesSearch",
+            "function topologyMatchesFilter",
+            "function topologyNodeDisplayState",
+            "function topologyZoomScale",
+            "function topologyPanView",
+            "function topologyTransform",
+            "function topologyRenderSignature",
+            "function restoreTopologyFocus",
+            "createElementNS(",
+            "textContent",
+            "ResizeObserver",
+        ):
+            self.assertIn(symbol, script)
+        self.assertIn(
+            "renderStats();\n  renderTopology();\n  renderScan();",
+            script,
+        )
+        self.assertIn("$('#topology-scan').addEventListener('click'", script)
+        self.assertNotIn("Math.random", script)
+
+        status, _, body = self.request("/static/styles.css")
+        self.assertEqual(status, 200)
+        css = body.decode()
+        for rule in (
+            ".topology-svg",
+            ".topology-link.is-offline",
+            ".topology-node.is-offline",
+            ".topology-node.trust-trusted",
+            ".topology-node.trust-unknown",
+            ".topology-node.trust-ignored",
+            ".topology-status-dot.offline",
+            ".topology-node.is-selected",
+            ".topology-node.is-dimmed",
+            ".topology-node.is-filtered",
+            ".topology-search",
+            ".topology-zoom",
+            ".topology-tooltip",
+            ".topology-selection",
+        ):
+            self.assertIn(rule, css)
+
+    def test_dashboard_topology_interactions_and_responsive_controls(self) -> None:
+        status, _, body = self.request("/static/app.js")
+        self.assertEqual(status, 200)
+        script = body.decode()
+        for marker in (
+            "map.addEventListener('click', onTopologyMapClick)",
+            "map.addEventListener('keydown', onTopologyMapKeydown)",
+            "map.addEventListener('pointerdown', onTopologyPanStart)",
+            "map.addEventListener('pointermove', onTopologyPanMove)",
+            "map.addEventListener('pointerup', onTopologyPanEnd)",
+            "map.addEventListener('pointercancel', onTopologyPanEnd)",
+            "search.addEventListener('input', onTopologySearchInput)",
+            "filters.addEventListener('click', onTopologyFilterClick)",
+            "openDrawer(key)",
+            "aria-current",
+            "tabindex: '0'",
+            "role: 'button'",
+            "setPointerCapture",
+            "releasePointerCapture",
+            "state.topology.view = topologyFitView()",
+            "TOPOLOGY_ZOOM_MIN",
+            "TOPOLOGY_ZOOM_MAX",
+            "safeWidth < 900",
+            "Math.min(width * 0.41, 330)",
+        ):
+            self.assertIn(marker, script)
+        self.assertNotIn("Math.random", script)
+        self.assertNotIn("fetch('https://", script)
+        self.assertNotIn("fetch(\"https://", script)
+
+        status, _, body = self.request("/static/styles.css")
+        self.assertEqual(status, 200)
+        css = body.decode()
+        self.assertIn("touch-action: none", css)
+        self.assertIn("@media (pointer: coarse)", css)
+        self.assertIn(".topology-control { min-width: 40px; height: 38px; }", css)
+        self.assertIn(
+            ".topology-filters .filter-chip { min-height: 38px; padding: 0 12px; }",
+            css,
+        )
+        self.assertIn(".topology-zoom { top: 6px; right: 8px; flex-direction: column; }", css)
+        self.assertIn("grid-template-columns: repeat(3, minmax(0, 1fr));", css)
+        self.assertIn("prefers-reduced-motion: reduce", css)
+
+    def test_topology_state_fields(self) -> None:
+        self.start_scan()
+        data = self.state()
+        self.assertEqual(data["network"]["gateway"], "10.0.0.1")
+        devices = {device["ip"]: device for device in data["devices"]}
+        gateway = devices["10.0.0.1"]
+        self.assertTrue(gateway["is_gateway"])
+        for key in ("name", "hostname", "kind", "online", "trust", "is_gateway"):
+            self.assertIn(key, gateway)
+        self.assertTrue(all("is_gateway" in device for device in data["devices"]))
+
     def test_dashboard_event_and_trust_controls(self) -> None:
         status, _, body = self.request("/")
         self.assertEqual(status, 200)
